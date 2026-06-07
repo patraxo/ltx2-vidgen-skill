@@ -1,4 +1,4 @@
-# ltx2-fast-inference
+# ltx2-claude-skill
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Serverless](https://img.shields.io/badge/serverless-Modal-7C3AED)
@@ -62,7 +62,7 @@ First clip cold-starts ~90 s; every warm clip after is 7–9 s.
 Drop a photo in Claude Code, ask for a video.
 
 ```bash
-# 1. deploy the backend (above) — the skill calls it BY APP NAME, no endpoint URL needed
+# 1. deploy the backend (above) — the skill calls it by Modal app name (`ltx2-fast-inference`), no endpoint URL needed
 # 2. install the skill (one-time)
 cp -R skills/ltx2-video ~/.claude/skills/ltx2-video
 pip install modal && modal token new      # the skill's script needs the Modal SDK
