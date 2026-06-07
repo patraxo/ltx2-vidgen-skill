@@ -7,9 +7,9 @@
 ![Precision](https://img.shields.io/badge/precision-bf16-0A7E8C)
 ![uv](https://img.shields.io/badge/packaging-uv-DE5FE9)
 
-> **Own your AI video pipeline.** Self-hosted, optimized LTX-2.3 on serverless GPU — frontier-quality text-to-video, image-to-video, and keyframe interpolation for cents a clip, with no per-clip API meter and no rate limit.
+> **Own your AI video pipeline.** Self-hosted, optimized LTX-2.3 on serverless GPU — frontier-quality text-to-video, image-to-video, keyframe interpolation, and video-to-video for cents a clip, with no per-clip API meter and no rate limit.
 
-Fast, self-hosted **LTX-2.3** (Lightricks, 22B video DiT) on [Modal](https://modal.com) — text-to-video, image-to-video, and keyframe interpolation, with an optimization stack that turns a 10-second 9:16 reel into **~7–9s of warm generation for a few cents** on a single **RTX PRO 6000 (Blackwell)**. Output is verified **bit-identical** to the unoptimized path, bf16 throughout.
+Fast, self-hosted **LTX-2.3** (Lightricks, 22B video DiT) on [Modal](https://modal.com) — text-to-video, image-to-video, keyframe interpolation, and video-to-video, with an optimization stack that turns a 10-second 9:16 reel into **~7–9s of warm generation for a few cents** on a single **RTX PRO 6000 (Blackwell)**. Output is verified **bit-identical** to the unoptimized path, bf16 throughout.
 
 Generates at **any resolution** whose sides are divisible by 32 — 768×512, 768×1280 (vertical 9:16 reel), 1280×768, 1024×1024, etc. — and clips up to ~10 seconds, with optional generated audio.
 
@@ -49,7 +49,7 @@ LTX-2.3 is a 22B video diffusion transformer. Serving it naively has two costs: 
 6. **torch.compile + persisted Inductor cache.** The model is `torch.compile`d (default mode — `max-autotune` was tested and ran *slower* on this GPU), and the compiled artifact is persisted to the Modal volume, so the one-time compile is paid at the first cold start and restored on every later cold container instead of recompiling.
 7. **Blackwell-native attention.** flash-attention has no sm_120 kernel yet, so this runs PyTorch SDPA (exact). fp8/SageAttention were tested and rejected (noise / black frames) — speed comes from architecture, not from cheapening the math.
 
-The Modal app (`@app.cls Model` in `deploy/ltx2_model.py`) exposes text-to-video, image-to-video, and 2-frame keyframe interpolation. Helper modules live in `utils/` and are mounted into the container.
+The Modal app (`@app.cls Model` in `deploy/ltx2_model.py`) exposes **text-to-video**, **image-to-video**, **2-frame keyframe interpolation**, and **video-to-video** (retake / control-guided restyle). Helper modules live in `utils/` and are mounted into the container.
 
 ---
 
@@ -73,7 +73,7 @@ Measured on RTX PRO 6000 (Blackwell, 96 GB), bf16:
 
 GPU choice: RTX PRO 6000 (96 GB) over H100 → ~45% lower $/clip. Same model in bf16 = same-fidelity frames on any card; the GPU only moves speed and cost.
 
-**Resolution & aspect:** any side-of-32 resolution works. For vertical content, generate native 9:16 (e.g. 768×1280) rather than rendering wide and cropping — cropping discards ~66% of the pixels you paid to render and softens what's left.
+**Resolution & aspect:** any resolution whose sides are divisible by 32 — square, landscape, or vertical 9:16 (e.g. 768×1280).
 
 ---
 
