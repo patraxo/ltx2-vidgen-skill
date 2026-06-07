@@ -3153,6 +3153,70 @@ class Model:
         return temp_file.name
 
     @modal.method()
+    def smoke_modes(self) -> dict:
+        """Auth-free: validate i2v / keyframe / t2v paths in ONE warm container.
+        Tiny 320x256 / 17-frame / 4-step gens — confirms each mode's code path
+        runs (not a quality test). v2v/retake is tested via smoke_retake."""
+        import tempfile as _tf
+        import time as _t
+        from PIL import Image as _Image
+
+        def _mk(color):
+            p = _tf.mktemp(suffix=".png")
+            _Image.new("RGB", (320, 256), color).save(p)
+            return f"file://{p}"
+
+        cases = {
+            "i2v (1 image)": [_mk((128, 128, 128))],
+            "keyframe (2 images)": [_mk((40, 40, 90)), _mk((200, 120, 60))],
+            "t2v (0 images)": [],
+        }
+        results = {}
+        for name, urls in cases.items():
+            t0 = _t.time()
+            try:
+                vb = self._process_video_safe(
+                    image_urls=urls, prompt="a calm cinematic scene, soft light",
+                    negative_prompt="", num_frames=17, height=256, width=320,
+                    frame_rate=24.0, num_inference_steps=4, cfg_guidance_scale=3.0,
+                    seed=0, enhance_prompt=False, mode="default",
+                )
+                import base64 as _b64
+                results[name] = {"status": "ok", "video_bytes": len(vb) if vb else 0,
+                                 "latency_s": round(_t.time() - t0, 1),
+                                 "video_b64": _b64.b64encode(vb).decode("ascii") if vb else None}
+            except Exception as e:  # noqa: BLE001
+                results[name] = {"status": "UNSUPPORTED", "error": f"{type(e).__name__}: {str(e)[:140]}"}
+            print(f"   [MODE] {name}: {results[name].get('status')}")
+        return results
+
+    @modal.method()
+    def smoke_retake(
+        self, video_b64: str,
+        prompt: str = "same scene, vivid neon lighting, cinematic color grade",
+        start_time: float = 2.0, end_time: float = 5.0,
+        num_inference_steps: int = 20, seed: int = 0,
+    ) -> dict:
+        """Auth-free v2v retake: regenerate a time window of a source video."""
+        import base64 as _b64
+        import tempfile as _tf
+        import time as _t
+
+        src = _tf.mktemp(suffix=".mp4")
+        with open(src, "wb") as f:
+            f.write(_b64.b64decode(video_b64))
+        t0 = _t.time()
+        vb = self._process_retake_safe(
+            video_path=src, prompt=prompt, start_time=start_time, end_time=end_time,
+            negative_prompt="", num_inference_steps=num_inference_steps,
+            cfg_guidance_scale=3.0, seed=seed, regenerate_video=True,
+            regenerate_audio=False, enhance_prompt=False,
+        )
+        return {"status": "ok", "video_bytes": len(vb) if vb else 0,
+                "latency_s": round(_t.time() - t0, 1),
+                "video_b64": _b64.b64encode(vb).decode("ascii") if vb else None}
+
+    @modal.method()
     def smoke_generate(
         self,
         height: int = 256,
@@ -3929,3 +3993,49 @@ def smoke_real(
     print(f"latency_s={res.get('latency_s')}  peak_vram_gb={res.get('peak_vram_gb')}  bytes={res.get('video_bytes')}")
     print(f"wall(incl cold start)={elapsed:.1f}s  res={res.get('width')}x{res.get('height')}  frames={res.get('num_frames')}")
     print(f"Saved to: {out_path}" if vb64 else "NO video bytes returned")
+
+
+@app.local_entrypoint()
+def run_modes() -> None:
+    """Validate + SAVE t2v / i2v / keyframe in one warm container -> mode_clips/."""
+    import base64
+    import pathlib
+
+    out = pathlib.Path(__file__).parent / "mode_clips"
+    out.mkdir(parents=True, exist_ok=True)
+    print("\n=== LTX-2.3 MODE COVERAGE ===")
+    res = Model().smoke_modes.remote()  # type: ignore[union-attr]
+    for mode, r in res.items():
+        b64 = r.pop("video_b64", None)
+        if b64:
+            p = out / f"{mode.split()[0]}.mp4"
+            p.write_bytes(base64.b64decode(b64))
+            r["saved"] = str(p)
+        print(f"  {mode:24s} -> {r}")
+
+
+@app.local_entrypoint()
+def run_retake() -> None:
+    """v2v retake in its OWN fresh container (avoids VRAM contention with the
+    pipelines run_modes loads). Source = a real i2v clip in smoke_outputs/.
+    Saves mode_clips/v2v_retake.mp4."""
+    import base64
+    import pathlib
+
+    out = pathlib.Path(__file__).parent / "mode_clips"
+    out.mkdir(parents=True, exist_ok=True)
+    srcs = sorted((pathlib.Path(__file__).parent / "smoke_outputs").glob("real_*_i2v.mp4"))
+    if not srcs:
+        print("no source clip in smoke_outputs/ — run smoke_real first")
+        return
+    print(f"retake source: {srcs[-1].name}")
+    rr = Model().smoke_retake.remote(  # type: ignore[union-attr]
+        video_b64=base64.b64encode(srcs[-1].read_bytes()).decode("ascii"),
+        start_time=2.0, end_time=5.0, num_inference_steps=20,
+    )
+    b64 = rr.pop("video_b64", None)
+    if b64:
+        p = out / "v2v_retake.mp4"
+        p.write_bytes(base64.b64decode(b64))
+        rr["saved"] = str(p)
+    print(f"v2v (retake) -> {rr}")

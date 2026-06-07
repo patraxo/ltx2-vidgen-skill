@@ -28,6 +28,8 @@ uv run modal token new
 # 3. run it
 PYTHONPATH=. uv run modal run tests/smoke_test.py                                    # tiny smoke
 PYTHONPATH=. uv run modal run deploy/ltx2_model.py::smoke_real --image-path pic.jpg   # real-image i2v -> mp4
+PYTHONPATH=. uv run modal run deploy/ltx2_model.py::run_modes                         # t2v + i2v + keyframe, saved to mode_clips/
+PYTHONPATH=. uv run modal run deploy/ltx2_model.py::run_retake                        # v2v retake, saved to mode_clips/
 PYTHONPATH=. uv run modal run tests/ship_verify.py                                    # full verification
 ```
 
@@ -49,7 +51,20 @@ LTX-2.3 is a 22B video diffusion transformer. Serving it naively has two costs: 
 6. **torch.compile + persisted Inductor cache.** The model is `torch.compile`d (default mode — `max-autotune` was tested and ran *slower* on this GPU), and the compiled artifact is persisted to the Modal volume, so the one-time compile is paid at the first cold start and restored on every later cold container instead of recompiling.
 7. **Blackwell-native attention.** flash-attention has no sm_120 kernel yet, so this runs PyTorch SDPA (exact). fp8/SageAttention were tested and rejected (noise / black frames) — speed comes from architecture, not from cheapening the math.
 
-The Modal app (`@app.cls Model` in `deploy/ltx2_model.py`) exposes **text-to-video**, **image-to-video**, **2-frame keyframe interpolation**, and **video-to-video** (retake / control-guided restyle). Helper modules live in `utils/` and are mounted into the container.
+The Modal app (`@app.cls Model` in `deploy/ltx2_model.py`) exposes all four modes below. Helper modules live in `utils/` and are mounted into the container.
+
+---
+
+## Modes
+
+| Mode | Input | Underlying pipeline |
+|---|---|---|
+| **text-to-video** | prompt only | KeyframeInterpolation (0 keyframes) |
+| **image-to-video** | 1 image + prompt | TI2VidTwoStages |
+| **keyframe interpolation** | 2 images + prompt | KeyframeInterpolation |
+| **video-to-video (retake)** | source video + time window + prompt | RetakePipeline |
+
+Each is exercised by the test entrypoints (`run_modes` for t2v/i2v/keyframe, `run_retake` for v2v), which generate a clip per mode and save the `.mp4`s to `deploy/mode_clips/`. The optimization stack (resident pipeline, caching, batching) applies across all modes.
 
 ---
 
