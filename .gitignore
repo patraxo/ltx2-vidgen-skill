@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Outputs / artifacts (never commit generated media or caches)
+smoke_outputs/
+bench/
+clips_*/
+frames_*/
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.safetensors
+*.pt
+*.ckpt
+
+# Backups / scratch
+*.bak*
+*.log
+.DS_Store
+
+# Secrets — never commit
+.env
+*.key
+*_token*
+api_key*
