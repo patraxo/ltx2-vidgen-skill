@@ -11,7 +11,7 @@ description: >-
   Triggers: "make a video", "animate this photo", "image to video", "i2v",
   "keyframe", "interpolate", "video to video", "retake", "generate a clip/reel".
 argument-hint: "[/abs/path/image.jpg] [\"prompt\"] [i2v|keyframe|v2v|t2v]"
-allowed-tools: Bash(python3 *) Bash(ffmpeg *) Bash(file *) Bash(realpath *) Bash(test *) Bash(modal token *) Bash(modal app *) Read
+allowed-tools: Bash(uv run *) Bash(python3 *) Bash(ffmpeg *) Bash(file *) Bash(realpath *) Bash(test *) Bash(modal token *) Bash(modal app *) Read
 ---
 
 # ltx2-video — photo → video via self-hosted LTX-2.3
@@ -53,19 +53,19 @@ methods remotely via `modal.Cls.from_name` (no repo path needed).
 3. **Run** the script (set `--timeout 300` on the Bash call — the first run cold-starts):
    ```bash
    # i2v (full)
-   python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
+   uv run --with modal python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
      --mode i2v --image "<abs>" --prompt "<prompt>" --frames 97 --height 1280 --width 768
 
    # quick smoke (cheap warm-check)
-   python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
+   uv run --with modal python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
      --mode i2v --image "<abs>" --prompt "<prompt>" --frames 17 --height 320 --width 512 --steps 8
 
    # keyframe (two images)
-   python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
+   uv run --with modal python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
      --mode keyframe --image "<absA>" --image "<absB>" --prompt "<prompt>"
 
    # video-to-video retake
-   python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
+   uv run --with modal python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
      --mode v2v --video "<abs.mp4>" --prompt "<prompt>" --start 2 --end 5
 
    # text-to-video
