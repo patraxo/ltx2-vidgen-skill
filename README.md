@@ -1,12 +1,45 @@
-# ltx2-fast
+# ltx2-fast-inference
 
-Fast, self-hosted **LTX-2.3** (Lightricks, 22B video DiT) on [Modal](https://modal.com). An optimization stack that turns a 10-second 9:16 reel into **~7–9s of warm generation for a few cents**, on a single **RTX PRO 6000 (Blackwell)** — output verified **bit-identical** to the slow path.
+Fast, self-hosted **LTX-2.3** (Lightricks, 22B video DiT) on [Modal](https://modal.com) — text-to-video, image-to-video, and keyframe interpolation, with an optimization stack that turns a 10-second 9:16 reel into **~7–9s of warm generation for a few cents** on a single **RTX PRO 6000 (Blackwell)**. Output is verified **bit-identical** to the unoptimized path. bf16 only — no quality-degrading quantization. No secrets, no auth.
 
-> Text-to-video, image-to-video, and keyframe interpolation. bf16 only — no quality-degrading quantization.
+---
 
-## Why
+## Quickstart
 
-Hosted video APIs are excellent but charge per clip and rate-limit you. When you iterate — generate 100 takes, keep 3 — the 97 you discard cost exactly as much as the keepers. Running the open model yourself removes the per-clip meter and the rate limit, and lets you batch.
+```bash
+# 1. install the Modal client + authenticate (one-time)
+pip install -r requirements.txt        # just the Modal SDK
+modal token new
+
+# 2. deploy (no secrets to set up)
+./deploy.sh
+
+# 3. test it
+PYTHONPATH=. modal run tests/smoke_test.py                                    # tiny auth-free smoke
+PYTHONPATH=. modal run deploy/ltx2_model.py::smoke_real --image-path pic.jpg   # real-image i2v -> mp4
+PYTHONPATH=. modal run verification/ship_verify.py                             # full verification
+```
+
+That's it — `./deploy.sh` pushes the app to Modal and prints the endpoint. The first generation is a cold start (~90s); every clip after that on a warm container is 7–9s.
+
+> **Weights:** the LTX-2.3 weights (+ Gemma text encoder) are pulled into the Modal volume the app references on first build (public components only — no HuggingFace token needed). See the `download_models` step + volume name in `deploy/ltx2_model.py`.
+
+---
+
+## How it works
+
+LTX-2.3 is a 22B video diffusion transformer. Out of the box, serving it has two costs: a slow cold start, and a per-clip cost where the pipeline re-assembles and re-fuses model internals on **every** request. This repo attacks both:
+
+1. **Build once, stay resident.** The fully-assembled, LoRA-fused transformer is kept in memory between clips (resolution-keyed) instead of rebuilt per request. This is the single biggest win — it's what takes a clip from ~90s to ~7s.
+2. **Weight caching (CPU-pinned).** Weights are pinned in host RAM and streamed to GPU, skipping disk reads on warm loads. Bit-identical.
+3. **First-Block-Cache.** Skips recomputing the early transformer blocks whose features barely change across steps. ~17%, near-lossless.
+4. **Embedding cache.** The text encoder isn't re-run for a repeated prompt.
+5. **Batching.** Many clips in one warm container amortize the fixed cost — 32 at once ≈ 6.2× throughput.
+6. **Blackwell-native attention.** flash-attention has no sm_120 kernel yet, so this runs PyTorch SDPA (exact). fp8/SageAttention were tested and rejected (noise / black frames) — speed comes from architecture, not from cheapening the math.
+
+The Modal app (`@app.cls Model` in `deploy/ltx2_model.py`) exposes text-to-video, image-to-video, and 2-frame keyframe interpolation. The helper modules live in `utils/` and are mounted into the container.
+
+---
 
 ## Measured
 
@@ -24,52 +57,31 @@ Hosted video APIs are excellent but charge per clip and rate-limit you. When you
 | Batch 4 → 32 clips | 3.6× → 6.2× throughput, −84% $/clip |
 | **Net** | **1.96× faster, pixel-identical** |
 
-GPU: RTX PRO 6000 (96GB) over H100 → ~45% lower $/clip. Same model in bf16 = same-fidelity frames on any card; the GPU only moves speed/cost (it does, however, gate which precision/attention kernels are *available* — this runs SDPA + bf16 by design).
+GPU: RTX PRO 6000 (96GB) over H100 → ~45% lower $/clip. Same model in bf16 = same-fidelity frames on any card; the GPU only moves speed/cost.
+
+---
 
 ## Layout
 
 ```
+deploy.sh                  # one-command deploy (no secrets)
+requirements.txt           # client-side: just the Modal SDK
 deploy/
-  ltx2_model.py          # the Modal app (@app.cls Model): t2v / i2v / keyframe + the opt stack
-utils/                   # helper package (mounted into the container)
-  cpu_pinned_registry.py   # CPU-pinned weight cache (bit-identical, fast warm load)
-  gpu_resident_registry.py # resident-weights registry (VRAM-headroom guarded)
-  fbcache.py               # First-Block-Cache hook (near-lossless step skipping)
-  custom_guiders.py        # guidance helpers (APG / CFG variants)
+  ltx2_model.py            # the Modal app: t2v / i2v / keyframe + the opt stack
+utils/                     # helper package (mounted into the container)
+  cpu_pinned_registry.py     # CPU-pinned weight cache
+  gpu_resident_registry.py   # resident-weights registry (VRAM-headroom guarded)
+  fbcache.py                 # First-Block-Cache hook
+  custom_guiders.py          # guidance helpers (APG / CFG variants)
 tests/
-  smoke_test.py          # auth-free functional smoke (tiny i2v, verifies the opt stack)
+  smoke_test.py            # tiny auth-free functional smoke
 verification/
-  ship_verify.py         # prod ship-verification: latency/VRAM, bit-identical, audio-skip
-scripts/
-  deploy.sh              # one-command deploy (+ api-key secret setup)
-requirements.txt         # client-side: just the Modal SDK
+  ship_verify.py           # latency/VRAM + bit-identical + audio-skip verification
 ```
-
-## Deploy
-
-```bash
-pip install modal && modal token new          # one-time
-./scripts/deploy.sh                            # no secrets to set up — just deploys
-```
-
-### Test it
-
-```bash
-PYTHONPATH=. modal run tests/smoke_test.py                                   # tiny smoke
-PYTHONPATH=. modal run deploy/ltx2_model.py::smoke_real --image-path pic.jpg  # real-image i2v -> mp4
-PYTHONPATH=. modal run verification/ship_verify.py                            # full verification
-```
-
-## Secrets & weights
-
-- **No secrets required.** The endpoints are open (no JWT / no api-key) and no HuggingFace key is used. Nothing sensitive lives in this repo.
-- **Weights:** provision the LTX-2.3 weights (and the Gemma text encoder) to the Modal volume the app references (see the `download_models` step + volume name in `ltx2_model.py`). The build pulls only public components; if you ever need a *gated* model cold, add an HF token as a Modal secret and wire it into that step — otherwise pre-stage the weights in the volume.
 
 ## Notes
 
-- **bf16 only.** fp8 / fp4 / SageAttention were all tested and rejected (noise / black frames / won't build on Blackwell sm_120). Speed comes from caching + residency, not from cheapening the math.
-- **Blackwell (sm_120):** flash-attention has no kernel for it yet — this runs PyTorch SDPA, which is exact.
-- **Native 9:16:** generate vertical directly; don't render wide and crop (wastes ~66% of paid pixels).
+- **bf16 only**, no quantization. **Native 9:16** beats render-wide-then-crop (cropping wastes ~66% of paid pixels). No secrets / no auth — endpoints are open.
 
 ## License
 
