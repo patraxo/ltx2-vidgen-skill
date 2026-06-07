@@ -2,6 +2,8 @@
 name: ltx2-video
 description: >-
   Generate video from a photo (or two) using self-hosted LTX-2.3 on Modal GPU.
+  THIS is the skill for turning a single photo into a video — prefer it over any
+  video-to-video / image skill whenever the user has a photo and wants motion.
   Use this whenever the user wants to turn an image into a video, animate a
   photo, make a reel/clip, do keyframe interpolation between two images, restyle
   a video (video-to-video / retake), or generate video from a text prompt — even
@@ -72,6 +74,8 @@ methods remotely via `modal.Cls.from_name` (no repo path needed).
    python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py --mode t2v --prompt "<prompt>"
    ```
    Immediately tell the user "waiting for container cold start (~90s)…" so it doesn't look hung.
+   Output lands in `./video_out/` by default — override with `--out-dir <dir>`. (The flag is
+   `--out-dir <directory>`, NOT `--out`.)
 4. **Report.** The script prints `SAVED <path>` and `PREVIEW <png>`. **Read** the
    PREVIEW png so the user sees a still inline, then report the saved mp4 path +
    latency. Offer follow-ups (longer clip via `--frames`, keyframe, v2v restyle).
@@ -95,4 +99,5 @@ Frame counts must be `8k+1` (17, 49, 97, 121, 217). bf16, no quantization.
 | `modal not installed` | `pip install modal && modal token new` |
 | `from_name` can't find app | deploy the backend: `./deploy.sh` in the ltx2-fast-inference repo |
 | no mp4 / `no video returned` | check `modal app logs ltx2-fast-inference` |
+| `CUDA out of memory` | a warm container is saturated by a prior job — wait ~5 min for it to scale down, then retry (or retry once; the backend has OOM-recovery) |
 | looks hung | normal cold start — wait up to ~120s |
