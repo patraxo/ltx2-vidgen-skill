@@ -30,6 +30,7 @@ PYTHONPATH=. uv run modal run tests/smoke_test.py                               
 PYTHONPATH=. uv run modal run deploy/ltx2_model.py::smoke_real --image-path pic.jpg   # real-image i2v -> mp4
 PYTHONPATH=. uv run modal run deploy/ltx2_model.py::run_modes                         # t2v + i2v + keyframe, saved to mode_clips/
 PYTHONPATH=. uv run modal run deploy/ltx2_model.py::run_retake                        # v2v retake, saved to mode_clips/
+PYTHONPATH=. uv run modal run deploy/ltx2_model.py::kf_real --image-a a.jpg --image-b b.jpg  # real 2-image keyframe -> mode_clips/
 PYTHONPATH=. uv run modal run tests/ship_verify.py                                    # full verification
 ```
 

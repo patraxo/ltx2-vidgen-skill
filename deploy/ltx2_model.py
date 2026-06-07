@@ -3246,16 +3246,21 @@ class Model:
         from PIL import Image as _Image
 
         smoke_img_path = "/tmp/_ltx2_smoke.png"
+        import base64 as _b64_sm
+        import io as _io_sm
         if image_b64:
-            # Real-input i2v: decode the provided image and use it as the
-            # conditioning frame (resized to the target i2v resolution).
-            import base64 as _b64_sm
-            import io as _io_sm
-            _src = _Image.open(_io_sm.BytesIO(_b64_sm.b64decode(image_b64))).convert("RGB")
-            _src = _src.resize((width, height), _Image.LANCZOS)
-            _src.save(smoke_img_path)
+            # One image -> i2v; a list of 2+ -> keyframe interpolation.
+            _items = image_b64 if isinstance(image_b64, list) else [image_b64]
+            smoke_img_urls = []
+            for _i, _b in enumerate(_items):
+                _src = _Image.open(_io_sm.BytesIO(_b64_sm.b64decode(_b))).convert("RGB")
+                _src = _src.resize((width, height), _Image.LANCZOS)
+                _p = f"/tmp/_ltx2_smoke_{_i}.png"
+                _src.save(_p)
+                smoke_img_urls.append(f"file://{_p}")
         else:
             _Image.new("RGB", (width, height), color=(128, 128, 128)).save(smoke_img_path)
+            smoke_img_urls = [f"file://{smoke_img_path}"]
 
         if _t_sm.cuda.is_available():
             try:
@@ -3274,7 +3279,7 @@ class Model:
 
         t0 = _time.time()
         video_bytes = self._process_video_safe(
-            image_urls=[f"file://{smoke_img_path}"],
+            image_urls=smoke_img_urls,
             prompt=prompt,
             negative_prompt="",
             num_frames=num_frames,
@@ -4039,3 +4044,35 @@ def run_retake() -> None:
         p.write_bytes(base64.b64decode(b64))
         rr["saved"] = str(p)
     print(f"v2v (retake) -> {rr}")
+
+
+@app.local_entrypoint()
+def kf_real(
+    image_a: str, image_b: str,
+    prompt: str = "smooth cinematic transition between the two scenes, natural motion",
+    num_frames: int = 97, height: int = 1280, width: int = 768,
+    num_inference_steps: int = 25,
+) -> None:
+    """Real-image keyframe interpolation: 2 images -> interpolated video.
+    Saves mode_clips/kf_real.mp4."""
+    import base64
+    import pathlib
+
+    out = pathlib.Path(__file__).parent / "mode_clips"
+    out.mkdir(parents=True, exist_ok=True)
+
+    def _b64img(path):
+        return base64.b64encode(pathlib.Path(path).read_bytes()).decode("ascii")
+
+    res = Model().smoke_generate.remote(  # type: ignore[union-attr]
+        height=height, width=width, num_frames=num_frames,
+        num_inference_steps=num_inference_steps, prompt=prompt,
+        image_b64=[_b64img(image_a), _b64img(image_b)], return_video_b64=True, seed=42,
+    )
+    b64 = res.get("video_b64")
+    if b64:
+        p = out / "kf_real.mp4"
+        p.write_bytes(base64.b64decode(b64))
+        print(f"keyframe saved: {p}  ({res.get('video_bytes')} B, {res.get('latency_s')}s)")
+    else:
+        print(f"NO video bytes -> {res}")
