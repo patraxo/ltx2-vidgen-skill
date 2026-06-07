@@ -46,7 +46,8 @@ LTX-2.3 is a 22B video diffusion transformer. Serving it naively has two costs: 
 3. **First-Block-Cache.** Skips recomputing the early transformer blocks whose features barely change across steps. ~17%, near-lossless.
 4. **Embedding cache.** The text encoder isn't re-run for a repeated prompt.
 5. **Batching.** Many clips in one warm container amortize the fixed cost — 32 at once ≈ 6.2× throughput.
-6. **Blackwell-native attention.** flash-attention has no sm_120 kernel yet, so this runs PyTorch SDPA (exact). fp8/SageAttention were tested and rejected (noise / black frames) — speed comes from architecture, not from cheapening the math.
+6. **torch.compile + persisted Inductor cache.** The model is `torch.compile`d (default mode — `max-autotune` was tested and ran *slower* on this GPU), and the compiled artifact is persisted to the Modal volume, so the one-time compile is paid at the first cold start and restored on every later cold container instead of recompiling.
+7. **Blackwell-native attention.** flash-attention has no sm_120 kernel yet, so this runs PyTorch SDPA (exact). fp8/SageAttention were tested and rejected (noise / black frames) — speed comes from architecture, not from cheapening the math.
 
 The Modal app (`@app.cls Model` in `deploy/ltx2_model.py`) exposes text-to-video, image-to-video, and 2-frame keyframe interpolation. Helper modules live in `utils/` and are mounted into the container.
 
