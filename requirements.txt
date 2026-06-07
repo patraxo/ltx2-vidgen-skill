@@ -1,4 +1,0 @@
-# Local (client-side) dependency only — everything else (torch, ltx-pipelines,
-# diffusers, etc.) is installed INSIDE the Modal container image, defined in
-# deploy/ltx2_model.py. You only need the Modal CLI/SDK locally to deploy + run.
-modal>=1.0

@@ -1,0 +1,16 @@
+[project]
+name = "ltx2-fast-inference"
+version = "0.1.0"
+description = "Fast, self-hosted LTX-2.3 (22B) video inference on Modal — text-to-video, image-to-video, and keyframe interpolation with a warm-path optimization stack."
+readme = "README.md"
+requires-python = ">=3.10"
+# Client-side only. Everything heavy (torch, ltx-pipelines, diffusers, …) is
+# installed inside the Modal container image defined in deploy/ltx2_model.py —
+# you only need the Modal SDK locally to deploy and run.
+dependencies = [
+    "modal>=1.0",
+]
+
+[tool.uv]
+# This is an app / script project, not a distributable package.
+package = false
