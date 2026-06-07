@@ -28,3 +28,6 @@ frames_*/
 *.key
 *_token*
 api_key*
+
+# skill output
+video_out/
