@@ -27,6 +27,7 @@ Turns a local image (or two, or a video) into an `.mp4` by calling the user's
 | `keyframe` | 2 images + prompt | interpolates A → B |
 | `v2v` | 1 video + prompt | regenerates a time window (retake) |
 | `t2v` | prompt only | text-to-video, no image |
+| `control` | control render (+ optional init image) + prompt | IC-LoRA structural control — `union` follows a canny/depth/pose render. Canny auto-derives from a source video via ffmpeg; depth/pose need a pre-rendered control video. |
 
 The work is done by `scripts/submit_video.py`, which calls the deployed app's
 methods remotely via `modal.Cls.from_name` (no repo path needed).
@@ -72,6 +73,14 @@ methods remotely via `modal.Cls.from_name` (no repo path needed).
 
    # text-to-video
    python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py --mode t2v --prompt "<prompt>"
+
+   # control (IC-LoRA union): auto-derive a CANNY edge render from a source video and follow it
+   uv run --with modal python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
+     --mode control --video "<abs.mp4>" --control-type canny --prompt "<prompt>" [--image "<init.jpg>"]
+
+   # control with a PRE-RENDERED control video (depth map / openpose / canny you already have)
+   uv run --with modal python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
+     --mode control --control-video "<abs_control.mp4>" --prompt "<prompt>" [--image "<init.jpg>"]
    ```
    Immediately tell the user "waiting for container cold start (~90s)…" so it doesn't look hung.
    Output lands in `./video_out/` by default — override with `--out-dir <dir>`. (The flag is
