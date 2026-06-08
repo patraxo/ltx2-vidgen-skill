@@ -99,5 +99,5 @@ Frame counts must be `8k+1` (17, 49, 97, 121, 217). bf16, no quantization.
 | `modal not installed` | `pip install modal && modal token new` |
 | `from_name` can't find app | deploy the backend: `./deploy.sh` in the ltx2-fast-inference repo |
 | no mp4 / `no video returned` | check `modal app logs ltx2-fast-inference` |
-| `CUDA out of memory` | a warm container is saturated by a prior job — wait ~5 min for it to scale down, then retry (or retry once; the backend has OOM-recovery) |
+| `CUDA out of memory` | should not happen on mode-switching anymore — the backend evicts resident transformers automatically (activation-aware cap) so each forward fits. If it ever appears, just retry once; the backend also has OOM-recovery. |
 | looks hung | normal cold start — wait up to ~120s |

@@ -241,6 +241,28 @@ else:
 # single pair resident and switches cleanly). Do NOT raise above 2 on this card.
 _PERSIST_LRU_MAX = int(os.environ.get("LTX_PERSIST_LRU_MAX", "2"))
 
+# Free VRAM (GB) kept available before BUILDING a new resident transformer or
+# loading the non-persist RetakePipeline (v2v). When free VRAM drops below this,
+# LRU residents are evicted (→ pinned host weights, rebuilt on next miss) until
+# the headroom is met. This is the PROACTIVE companion to the count cap above:
+# the cap bounds the NUMBER of residents, this bounds FREE space so a different
+# mode/resolution (or RetakePipeline, which can't reuse the persisted stages)
+# never stacks onto a near-full 96 GB card and OOMs the forward-pass activations.
+# Default 40 GB. This is sized to the COST OF THE THING WE'RE MAKING ROOM FOR,
+# not to leftover slack: a single LTX-2.3 stage transformer is ~34 GB and a
+# build/forward needs activation room on top. With 16 GB the guard saw the
+# ~20 GB of steady-state slack after a warm pair, decided no eviction was
+# needed, then tried to BUILD a ~34 GB transformer into 20 GB free → OOM
+# (verified 2026-06-08: keyframe→i2v switch, 94.8/95 GB, 1.88 GB activation
+# alloc failed). 40 GB forces eviction of a resident from the OTHER pipeline
+# family BEFORE a cross-family/cross-resolution build, so there is always room
+# to build the new ~34 GB stage + run its forward. Same-mode warm repeats are a
+# cache HIT (no build, guard not consulted) so warm speed is preserved; only the
+# first build after a switch pays the eviction. At heavy-base modes (i2v/t2v load
+# the audio + Gemma stack, ~+17 GB) this naturally self-limits to one resident
+# stage at a time, which is the most the 96 GB card can hold alongside them.
+_VRAM_HEADROOM_GB = float(os.environ.get("LTX_VRAM_HEADROOM_GB", "40"))
+
 # Resident-transformer registry (lives on the warm container). An LRU OrderedDict keyed
 # by (id(stage), role, height, width) → the built transformer kept on GPU. Guarded so a
 # cached module + a rebuilt module can never coexist.
@@ -258,7 +280,112 @@ _PERSIST_STATE: dict = {
     "stage2_builds": 0,
     "evictions": 0,
     "oom_fallback": False,
+    "lru_max": _PERSIST_LRU_MAX,   # activation-aware cap, set per-request
 }
+
+
+def _free_vram_gb() -> float:
+    """Free GPU VRAM in GB via the CUDA driver. Returns +inf when CUDA is
+    unavailable or the query fails, so headroom checks never block in those
+    cases. Reads mem_get_info()[0] (free bytes) which reflects what the caching
+    allocator can hand out — accurate even with expandable_segments:True."""
+    try:
+        import torch as _t
+        if not _t.cuda.is_available():
+            return float("inf")
+        return _t.cuda.mem_get_info()[0] / (1024 ** 3)
+    except Exception:
+        return float("inf")
+
+
+def _evict_lru_resident() -> bool:
+    """Module-level LRU eviction of the oldest persisted transformer. Mirrors
+    the closure `_evict_one_lru` (which is not visible outside _gpu_init) so the
+    retake path and the build-miss path can both free residents. Moves the module
+    to meta, then gc.collect() → empty_cache() → synchronize() so the freed CUDA
+    blocks actually return to the allocator (ref cycles in the pipeline need gc
+    before empty_cache reclaims anything). Returns False when nothing to evict."""
+    try:
+        old_key, old_mod = _PERSIST_TRANSFORMERS.popitem(last=False)
+    except KeyError:
+        return False
+    try:
+        old_mod.to("meta")
+    except Exception:
+        pass
+    _PERSIST_STATE["evictions"] += 1
+    print(f"   [PERSIST] 🗑️  headroom evict resident {old_key}; freeing")
+    try:
+        import gc as _gc
+        import torch as _t
+        _gc.collect()
+        if _t.cuda.is_available():
+            _t.cuda.empty_cache()
+            _t.cuda.synchronize()
+    except Exception:
+        pass
+    return True
+
+
+def _ensure_vram_headroom(required_gb: float) -> None:
+    """Proactively evict LRU residents until at least `required_gb` of VRAM is
+    free. No-op on the fast path (enough headroom already → no eviction, warm
+    same-mode speed preserved). Used before BUILDING a new resident transformer
+    and before loading the non-persist RetakePipeline (v2v). Transient: does NOT
+    change _PERSIST_STATE['mode']; the next same-mode call rebuilds/reuses
+    normally. If residents run out before headroom is met, the existing reactive
+    OOM fallback is the last-resort net."""
+    before = _free_vram_gb()
+    if before >= required_gb:
+        return
+    print(f"   [PERSIST] headroom {before:.1f}GB < {required_gb:.1f}GB target "
+          f"-> evicting residents (have {len(_PERSIST_TRANSFORMERS)})")
+    while _free_vram_gb() < required_gb and _PERSIST_TRANSFORMERS:
+        if not _evict_lru_resident():
+            break
+    print(f"   [PERSIST] headroom now {_free_vram_gb():.1f}GB "
+          f"(residents={len(_PERSIST_TRANSFORMERS)})")
+
+
+def _free_all_residents() -> None:
+    """Evict every persisted transformer. Used before the single-stage
+    RetakePipeline (v2v), which cannot reuse the two-stage residents and needs
+    the room for its own ~35 GB weights + forward."""
+    n = len(_PERSIST_TRANSFORMERS)
+    if n == 0:
+        return
+    print(f"   [PERSIST] freeing ALL {n} residents (v2v needs the room)")
+    while _PERSIST_TRANSFORMERS:
+        if not _evict_lru_resident():
+            break
+
+
+# Per-stage transformer is ~35 GB resident. The two-stage forward also needs an
+# ACTIVATION + audio/VAE/text working set that scales with height*width*frames
+# (measured ~24 GB at 1280x768x97, ~9-10 GB at 512x768x97). On a 96 GB card you
+# cannot hold BOTH 35 GB stage transformers resident AND run a high-res forward:
+# 2*35 + 24 = 94 GB -> OOM (verified 2026-06-08: warm i2v at 1280x768 hit
+# 93.96/95 GB with 2 residents). Cold generation only fits because the stages
+# build sequentially (stage_2 isn't resident while stage_1 runs). So the resident
+# cap MUST be activation-aware: keep as many stage transformers resident as fit
+# alongside the projected forward working set. At 1280x768x97 -> 1 (rotates the
+# two stages, slower warm but never OOM); at <=512 height -> 2 (both resident,
+# fast warm). Never exceed _PERSIST_LRU_MAX. LTX_VRAM_USABLE_GB / LTX_XFMR_GB let
+# the math be retuned without code changes.
+_VRAM_USABLE_GB = float(os.environ.get("LTX_VRAM_USABLE_GB", "91"))
+_XFMR_GB = float(os.environ.get("LTX_XFMR_GB", "35"))
+
+
+def _max_residents_for(height: int, width: int, num_frames: int) -> int:
+    """How many ~35 GB stage transformers can stay resident alongside this
+    request's projected activation working set. Clamped to [1, _PERSIST_LRU_MAX]."""
+    try:
+        mpx_frames = (float(height) * float(width) * float(num_frames)) / 1.0e6
+        extras_gb = 0.25 * mpx_frames + 4.0  # activation + audio/VAE/text + margin
+        n = int((_VRAM_USABLE_GB - extras_gb) / _XFMR_GB)
+    except Exception:
+        n = 1
+    return max(1, min(_PERSIST_LRU_MAX, n))
 
 # 2026-06-06: SageAttention-3 (Blackwell FP4 attention) toggle. Default OFF.
 # When "1", _gpu_init monkey-patches LTX's `Attention.forward` so the UNMASKED
@@ -1244,10 +1371,19 @@ class Model:
                         print(f"   [PERSIST] {role} REUSE resident transformer "
                               f"({w}x{h}, no rebuild/refuse)  cuda_alloc={_alloc:.2f}GB")
                         return _resident_ctx(cached)
-                    # Build ONCE for this (stage, role, resolution). Evict the oldest
-                    # resident first if at the LRU cap so a cached + rebuilt module
-                    # can never coexist (bounds VRAM).
-                    while len(_PERSIST_TRANSFORMERS) >= _PERSIST_LRU_MAX:
+                    # Build ONCE for this (stage, role, resolution). First make
+                    # PROACTIVE room: evict LRU residents until LTX_VRAM_HEADROOM_GB
+                    # is free, so a different-resolution/mode build never stacks onto
+                    # a near-full card and OOMs the forward activations. Then keep the
+                    # count cap as defense-in-depth (a cached + rebuilt module can
+                    # never coexist).
+                    _ensure_vram_headroom(_VRAM_HEADROOM_GB)
+                    # Activation-aware cap (set per-request in _process_video):
+                    # evict so that resident_count + this build stays within what
+                    # the forward working set leaves room for. Falls back to the
+                    # static LRU cap if unset.
+                    _cap = _PERSIST_STATE.get("lru_max", _PERSIST_LRU_MAX)
+                    while len(_PERSIST_TRANSFORMERS) >= _cap:
                         _evict_one_lru()
                     if _t_p.cuda.is_available():
                         _t_p.cuda.synchronize()
@@ -2298,6 +2434,9 @@ class Model:
         from ltx_pipelines.utils.media_io import encode_video
 
         total_start = time.time()
+        # ICLoraPipeline (distilled base) is NOT persist-tagged and can't reuse the
+        # resident two-stage transformers — free them so control gen has the card.
+        _free_all_residents()
         pipeline = self._get_ic_lora_pipeline(control)
 
         # Resolve control/reference video (URL or file://).
@@ -2733,6 +2872,9 @@ class Model:
         # is what makes mixed-resolution serving (768x512 + 768x1280) safe.
         _PERSIST_CURRENT_SHAPE["height"] = height
         _PERSIST_CURRENT_SHAPE["width"] = width
+        # Activation-aware resident cap for THIS request's resolution/frames, so a
+        # high-res forward never collides with two resident stage transformers.
+        _PERSIST_STATE["lru_max"] = _max_residents_for(height, width, num_frames)
         # `persist_mode` (None → keep current/env default) lets a request step the
         # mode at runtime. When the mode CHANGES we evict every resident the new
         # mode would no longer use, so a cached + a rebuilt module never coexist.
@@ -3217,6 +3359,83 @@ class Model:
                 "video_b64": _b64.b64encode(vb).decode("ascii") if vb else None}
 
     @modal.method()
+    def smoke_control(
+        self,
+        control: str = "union",                 # "union" (Canny/Depth/Pose) | "motion_track"
+        control_video_b64: str = "",            # the positionally-aligned control render (canny/depth/pose/track) as mp4
+        prompt: str = "a cinematic scene, photorealistic",
+        image_b64: str | None = None,           # optional init frame (i2v-style conditioning)
+        num_frames: int = 97,
+        height: int = 768,
+        width: int = 768,
+        seed: int = 0,
+        control_strength: float = 1.0,
+    ) -> dict:
+        """Auth-free IC-LoRA control smoke: drives mode='union' (Canny+Depth+Pose)
+        or 'motion_track'. Returns a diagnostic dict (never raises) with VRAM +
+        persist counters so the client can read failures without torch locally."""
+        import base64 as _b64
+        import tempfile as _tf
+        import time as _t
+        import torch as _t_sm
+
+        if not control_video_b64:
+            return {"status": "ERROR", "error": "control_video_b64 required", "is_oom": False}
+        cv = _tf.mktemp(suffix=".mp4")
+        with open(cv, "wb") as f:
+            f.write(_b64.b64decode(control_video_b64))
+        image_urls = None
+        if image_b64:
+            ip = _tf.mktemp(suffix=".png")
+            with open(ip, "wb") as f:
+                f.write(_b64.b64decode(image_b64))
+            image_urls = [f"file://{ip}"]
+        if _t_sm.cuda.is_available():
+            try:
+                _t_sm.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+        t0 = _t.time()
+        try:
+            vb = self._process_ic_lora_safe(
+                control=control,
+                control_video_url=f"file://{cv}",
+                prompt=prompt,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                frame_rate=24.0,
+                seed=seed,
+                image_urls=image_urls,
+                control_strength=control_strength,
+                enhance_prompt=False,
+            )
+        except Exception as _e:
+            _free = -1.0
+            if _t_sm.cuda.is_available():
+                try:
+                    _free = round(_t_sm.cuda.mem_get_info()[0] / (1 << 30), 2)
+                except Exception:
+                    pass
+            return {"status": "ERROR", "control": control,
+                    "error": f"{type(_e).__name__}: {str(_e)[:400]}",
+                    "is_oom": ("out of memory" in str(_e).lower() or type(_e).__name__ == "OutOfMemoryError"),
+                    "latency_s": round(_t.time() - t0, 2), "free_vram_gb": _free,
+                    "persist_resident_count": len(_PERSIST_TRANSFORMERS)}
+        peak = 0.0
+        if _t_sm.cuda.is_available():
+            try:
+                peak = round(_t_sm.cuda.max_memory_allocated() / (1 << 30), 2)
+            except Exception:
+                pass
+        return {"status": "ok", "control": control,
+                "video_bytes": len(vb) if vb else 0,
+                "latency_s": round(_t.time() - t0, 2), "peak_vram_gb": peak,
+                "height": height, "width": width, "num_frames": num_frames,
+                "persist_resident_count": len(_PERSIST_TRANSFORMERS),
+                "video_b64": _b64.b64encode(vb).decode("ascii") if vb else None}
+
+    @modal.method()
     def smoke_generate(
         self,
         height: int = 256,
@@ -3278,39 +3497,72 @@ class Model:
         _ev0 = _PERSIST_STATE["evictions"]
 
         t0 = _time.time()
-        video_bytes = self._process_video_safe(
-            image_urls=smoke_img_urls,
-            prompt=prompt,
-            negative_prompt="",
-            num_frames=num_frames,
-            height=height,
-            width=width,
-            frame_rate=24.0,
-            num_inference_steps=num_inference_steps,
-            cfg_guidance_scale=3.0,
-            seed=seed,
-            enhance_prompt=False,
-            mode="default",
-            enable_step_cache=False,
-            guider="cfg",
-            skip_audio=skip_audio,
-            emb_cache=emb_cache,
-            persist_mode=persist_mode,
-        )
+        try:
+            video_bytes = self._process_video_safe(
+                image_urls=smoke_img_urls,
+                prompt=prompt,
+                negative_prompt="",
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                frame_rate=24.0,
+                num_inference_steps=num_inference_steps,
+                cfg_guidance_scale=3.0,
+                seed=seed,
+                enhance_prompt=False,
+                mode="default",
+                enable_step_cache=False,
+                guider="cfg",
+                skip_audio=skip_audio,
+                emb_cache=emb_cache,
+                persist_mode=persist_mode,
+            )
+        except Exception as _e:
+            # Return the failure as a DIAGNOSTIC dict (don't raise) so the client
+            # — which may not have torch installed to deserialize a remote
+            # torch.OutOfMemoryError — can see the VRAM state + persist counters.
+            _free = _resv = _alloc = -1.0
+            if _t_sm.cuda.is_available():
+                try:
+                    _fb, _tb = _t_sm.cuda.mem_get_info()
+                    _free = round(_fb / (1 << 30), 2)
+                    _resv = round(_t_sm.cuda.memory_reserved() / (1 << 30), 2)
+                    _alloc = round(_t_sm.cuda.memory_allocated() / (1 << 30), 2)
+                except Exception:
+                    pass
+            return {
+                "status": "ERROR",
+                "error": f"{type(_e).__name__}: {str(_e)[:400]}",
+                "is_oom": ("out of memory" in str(_e).lower()
+                           or type(_e).__name__ == "OutOfMemoryError"),
+                "latency_s": round(_time.time() - t0, 2),
+                "free_vram_gb": _free, "reserved_vram_gb": _resv, "allocated_vram_gb": _alloc,
+                "height": height, "width": width, "num_frames": num_frames,
+                "persist_mode": _PERSIST_STATE["mode"],
+                "persist_resident_count": len(_PERSIST_TRANSFORMERS),
+                "persist_evictions": _PERSIST_STATE["evictions"],
+                "persist_oom_fallback": _PERSIST_STATE["oom_fallback"],
+            }
         elapsed = _time.time() - t0
 
         peak_gb = 0.0
+        free_gb = resv_gb = -1.0
         if _t_sm.cuda.is_available():
             try:
                 peak_gb = _t_sm.cuda.max_memory_allocated() / (1 << 30)
+                _fb, _tb = _t_sm.cuda.mem_get_info()
+                free_gb = round(_fb / (1 << 30), 2)
+                resv_gb = round(_t_sm.cuda.memory_reserved() / (1 << 30), 2)
             except Exception:
-                peak_gb = 0.0
+                pass
 
         return {
             "status": "ok",
             "video_bytes": len(video_bytes) if video_bytes else 0,
             "latency_s": round(elapsed, 2),
             "peak_vram_gb": round(peak_gb, 2),
+            "free_vram_gb": free_gb,
+            "reserved_vram_gb": resv_gb,
             "height": height,
             "width": width,
             "num_frames": num_frames,
@@ -3387,6 +3639,11 @@ class Model:
 
         total_start = time.time()
 
+        # RetakePipeline is NOT persist-tagged, so it can't reuse the resident
+        # keyframe/i2v stage transformers — it would load on TOP of them and OOM
+        # a near-full card. Free ALL residents so v2v has the full card for its
+        # own ~35 GB weights + forward (the #1 back-to-back OOM fix).
+        _free_all_residents()
         pipeline = self._get_retake_pipeline()
 
         src = get_videostream_metadata(video_path)

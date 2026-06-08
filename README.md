@@ -94,21 +94,28 @@ All four are exercised by `run_modes` / `run_retake` / `kf_real` and verified wo
 
 ## Performance
 
-Measured on RTX PRO 6000 (Blackwell, 96 GB), bf16, all outputs bit-identical to the unoptimized path:
+Measured on RTX PRO 6000 (Blackwell, 96 GB), bf16. Latency has **two regimes**, and which one you're in depends on whether two stage transformers can stay resident alongside the forward-pass activation working set:
 
-| Resolution | Cold (once per container) | Warm (every clip) | Peak VRAM |
-|---|---|---|---|
-| 768×512 | 93.6 s | **7.3 s** | ~72 GB |
-| 768×1280 (9:16 reel) | — | **9.3 s** | ~72 GB |
+| Config | Warm latency | Why |
+|---|---|---|
+| Short clip (≤97 f), low res — 2 transformers cached | **~7–9 s** | both stages resident → no rebuild |
+| 4 s clip (97 f) @ 1280×768 | **~42 s** | activation bigger; eviction starts |
+| 10 s clip (241 f) @ 1280×768 | **~95–120 s** | only 1 transformer fits alongside activation → both stages rebuilt per call |
+| 10 s video-to-video (retake) | **~470 s** | single-stage full-CFG, the heaviest mode |
+| 4 s control (IC-LoRA union, no init) | **~28 s** | distilled control base is lighter |
 
-| Optimization | Gain (all bit-identical) |
+Cold start (first clip on a fresh container): ~90–200 s. Every config above is **a few cents** at per-second billing.
+
+**The catch (be honest):** the famous "~9 s warm" only holds for *short, low-res* clips where both stage transformers fit resident. A full 10-second 720p reel can hold only **one** ~35 GB stage transformer next to the ~24 GB activation set on a 96 GB card, so each call rebuilds the stages — ~1–2 min, not 9 s. Still cheap, still self-hosted, just not 9 s.
+
+| Optimization | Gain (measured on short clips, bit-identical) |
 |---|---|
 | CPU-pinned weight cache | −13–15 s per cold clip |
 | First-Block-Cache | −17%, lossless |
 | Text-embedding cache | −4 s |
-| Resident + pre-fused pipeline | kills the per-clip rebuild — biggest win |
+| Resident + pre-fused pipeline | kills the per-clip rebuild — biggest win *when it fits* |
 | Batch 4 → 32 clips | 3.6× → 6.2× throughput, −84% $/clip |
-| **Net** | **1.96× faster, pixel-identical** |
+| **Net (short-clip regime)** | **1.96× faster, pixel-identical** |
 
 GPU choice: RTX PRO 6000 over H100 → ~45% lower $/clip. Same model in bf16 = same-fidelity frames on any card; the GPU only moves speed and cost.
 
@@ -118,13 +125,14 @@ GPU choice: RTX PRO 6000 over H100 → ~45% lower $/clip. Same model in bf16 = s
 
 LTX-2.3 is a 22B video diffusion transformer. Serving it naively has two costs: a slow cold start, and a per-clip cost where the pipeline re-assembles + re-fuses model internals every request. This repo attacks both:
 
-1. **Build once, stay resident.** The fully-assembled, LoRA-fused transformer stays in GPU memory between clips (resolution-keyed, LRU-bounded) instead of rebuilt per request — the single biggest win, ~90 s → ~7 s.
-2. **CPU-pinned weight cache** — weights pinned in host RAM, streamed to GPU, skipping disk reads. Bit-identical.
-3. **First-Block-Cache** — skips recomputing early transformer blocks (~17%, near-lossless).
-4. **Embedding cache** — the text encoder isn't re-run for a repeated prompt.
-5. **Batching** — 32 clips in one warm container ≈ 6.2× throughput.
-6. **torch.compile + persisted Inductor cache** — compiled once on the first cold container, restored from the volume on later cold starts (`max-autotune` tested + rejected, slower here).
-7. **Blackwell-native attention** — flash-attn has no sm_120 kernel yet, so this runs PyTorch SDPA (exact). fp8/SageAttention tested + rejected (noise / black frames). Speed comes from architecture, not from cheapening the math.
+1. **Build once, stay resident.** The fully-assembled, LoRA-fused transformer stays in GPU memory between clips (resolution-keyed, LRU-bounded) instead of rebuilt per request — the single biggest win when it fits (short/low-res: ~90 s → ~7 s).
+2. **Activation-aware resident cap.** Each stage transformer is ~35 GB; the two-stage forward also needs an activation + audio/VAE/text working set that scales with `height × width × frames` (~24 GB at 1280×768×97). You can't hold *both* 35 GB transformers resident **and** run a high-res forward on a 96 GB card (2×35 + 24 = 94 GB → OOM). So the resident cap is computed per request: keep as many stage transformers resident as fit alongside the projected activation set (2 at low res = warm-fast; 1 at full-res 10 s = rebuild-per-call but never OOM). This is what makes back-to-back mode-switching safe.
+3. **CPU-pinned weight cache** — weights pinned in host RAM, streamed to GPU, skipping disk reads. Bit-identical.
+4. **First-Block-Cache** — skips recomputing early transformer blocks (~17%, near-lossless).
+5. **Embedding cache** — the text encoder isn't re-run for a repeated prompt.
+6. **Batching** — 32 clips in one warm container ≈ 6.2× throughput.
+7. **torch.compile + persisted Inductor cache** — compiled once on the first cold container, restored from the volume on later cold starts (`max-autotune` tested + rejected, slower here).
+8. **Blackwell-native attention** — flash-attn has no sm_120 kernel yet, so this runs PyTorch SDPA (exact). fp8/SageAttention tested + rejected (noise / black frames). Speed comes from architecture, not from cheapening the math.
 
 Helper modules live in `utils/` and are mounted into the container.
 
@@ -135,7 +143,10 @@ Helper modules live in `utils/` and are mounted into the container.
 | Variable | Default | Description |
 |---|---|---|
 | `LTX_PERSIST_PIPELINE` | `both` | Keep stage transformers GPU-resident across requests. `off`/`stage2`/`both`. |
-| `LTX_PERSIST_LRU_MAX` | `2` | Max resident (stage, resolution) entries. Don't exceed 2 on a 96 GB card. |
+| `LTX_PERSIST_LRU_MAX` | `2` | Upper bound on resident (stage, resolution) entries. The effective cap is computed per request (activation-aware, see below) and never exceeds this. |
+| `LTX_VRAM_HEADROOM_GB` | `40` | Free VRAM kept available before building a new resident transformer / loading the v2v/control pipeline. LRU residents are evicted to reach it, so a cross-mode/resolution build never OOMs the forward. |
+| `LTX_VRAM_USABLE_GB` | `91` | Usable VRAM for the activation-aware resident-cap math (96 GB card minus a safety margin). |
+| `LTX_XFMR_GB` | `35` | Assumed size of one stage transformer, used by the resident-cap math. |
 | `LTX_REGISTRY` | `cpu_pinned` | Weight cache: `cpu_pinned` (recommended) / `gpu_resident` / `off`. |
 | `LTX_CACHE_TEXT_EMB` | `1` | LRU cache on the text encoder output. |
 | `LTX_SKIP_AUDIO` | `0` | Per-request default for skipping audio decode (video pixels byte-identical). |
