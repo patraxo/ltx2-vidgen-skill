@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/packaging-uv-DE5FE9" alt="uv">
 </p>
 
-> **Own your AI video pipeline.** Self-hosted, optimized LTX-2.3 (22B) on serverless GPU — text-to-video, image-to-video, keyframe interpolation, video-to-video, and IC-LoRA (canny/depth/pose) control, with synced audio, for a few cents a clip — no per-clip API meter, no rate limit. Ships as a **Claude Code skill** too: drop a photo in Claude Code → get a video.
+> **A Claude Code skill that owns your AI video pipeline** — drop a photo in Claude Code → get a video. It deploys your own optimized LTX-2.3 (22B) backend to *your* Modal serverless GPU and drives it: text-to-video, image-to-video, keyframe interpolation, video-to-video, and IC-LoRA (canny/depth/pose) control, with synced audio — a few cents a clip, your GPU, no per-clip API meter, no rate limit.
 
 <p align="center">
   <img src="assets/demo.gif" width="540" alt="LTX-2.3 image-to-video demo">
