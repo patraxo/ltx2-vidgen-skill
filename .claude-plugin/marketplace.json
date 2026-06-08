@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ltx2-vidgen-skill",
+  "description": "Self-hosted LTX-2.3 (22B) AI video generation for Claude Code — deploy your own Modal serverless-GPU backend, then generate.",
+  "owner": {
+    "name": "patraxo",
+    "url": "https://github.com/patraxo"
+  },
+  "plugins": [
+    {
+      "name": "ltx2-vidgen",
+      "description": "Drop a photo in Claude Code and get a video. Self-hosted LTX-2.3 (22B): text-to-video, image-to-video, keyframe interpolation, video-to-video, and IC-LoRA canny/depth/pose control, with synced audio. Deploys to your own Modal serverless GPU — a few cents a clip, no per-clip meter.",
+      "version": "1.0.0",
+      "author": {
+        "name": "patraxo",
+        "url": "https://github.com/patraxo"
+      },
+      "category": "creative",
+      "source": ".",
+      "strict": false,
+      "skills": [
+        "./skills/ltx2-video"
+      ],
+      "homepage": "https://github.com/patraxo/ltx2-vidgen-skill"
+    }
+  ]
+}

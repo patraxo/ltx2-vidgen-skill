@@ -39,6 +39,13 @@ npx skills add patraxo/ltx2-vidgen-skill        # or: cp -R skills/ltx2-video ~/
 pip install modal && modal token new            # Modal SDK + your account (free — $30/mo credits)
 ```
 
+…or as a Claude Code **plugin marketplace**:
+
+```text
+/plugin marketplace add patraxo/ltx2-vidgen-skill
+/plugin install ltx2-vidgen@ltx2-vidgen-skill
+```
+
 **2. Deploy your backend once** — into *your* Modal account (downloads the LTX-2.3 weights + Gemma text encoder; public components only, no HuggingFace token):
 
 ```bash
