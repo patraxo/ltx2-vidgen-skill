@@ -390,6 +390,44 @@ def _max_residents_for(height: int, width: int, num_frames: int) -> int:
         n = 1
     return max(1, min(_PERSIST_LRU_MAX, n))
 
+
+def _purge_stale_residents(height: int, width: int, cap: int) -> None:
+    """Run at the START of every request, BEFORE any allocation. Drops residents
+    whose resolution != this request's (a different-resolution resident can't be
+    reused and only burns ~35 GB — e.g. a 512-batch warm container hit by a 1280
+    request, which used to OOM the first call), then trims any remaining excess to
+    the activation-aware `cap`. Same-resolution residents within the cap are kept
+    (warm-speed preserved). Frees with gc + empty_cache + synchronize so the VRAM
+    is actually reclaimed before the forward builds anything."""
+    removed = 0
+    for k in list(_PERSIST_TRANSFORMERS.keys()):
+        # key = (id(stage), role, height, width)
+        if (k[2], k[3]) != (height, width):
+            mod = _PERSIST_TRANSFORMERS.pop(k, None)
+            if mod is not None:
+                try:
+                    mod.to("meta")
+                except Exception:
+                    pass
+                _PERSIST_STATE["evictions"] += 1
+                removed += 1
+    while len(_PERSIST_TRANSFORMERS) > max(0, cap):
+        if not _evict_lru_resident():
+            break
+        removed += 1
+    if removed:
+        print(f"   [PERSIST] purged {removed} stale/excess residents before forward "
+              f"(res={width}x{height}, cap={cap}, residents={len(_PERSIST_TRANSFORMERS)})")
+        try:
+            import gc as _gc
+            import torch as _t
+            _gc.collect()
+            if _t.cuda.is_available():
+                _t.cuda.empty_cache()
+                _t.cuda.synchronize()
+        except Exception:
+            pass
+
 # 2026-06-06: SageAttention-3 (Blackwell FP4 attention) toggle. Default OFF.
 # When "1", _gpu_init monkey-patches LTX's `Attention.forward` so the UNMASKED
 # self-attention path (attn1 / audio_attn1 — q==k==v, no context, no mask)
@@ -2878,6 +2916,10 @@ class Model:
         # Activation-aware resident cap for THIS request's resolution/frames, so a
         # high-res forward never collides with two resident stage transformers.
         _PERSIST_STATE["lru_max"] = _max_residents_for(height, width, num_frames)
+        # Proactively drop residents from a DIFFERENT resolution (and any excess
+        # over the cap) BEFORE the forward — stops a warm container loaded by a
+        # prior different-resolution request from OOMing this one's first call.
+        _purge_stale_residents(height, width, _PERSIST_STATE["lru_max"])
         # `persist_mode` (None → keep current/env default) lets a request step the
         # mode at runtime. When the mode CHANGES we evict every resident the new
         # mode would no longer use, so a cached + a rebuilt module never coexist.
