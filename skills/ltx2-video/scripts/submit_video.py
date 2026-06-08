@@ -85,6 +85,10 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=25)
     ap.add_argument("--start", type=float, default=2.0, help="v2v: window start (s)")
     ap.add_argument("--end", type=float, default=5.0, help="v2v: window end (s)")
+    ap.add_argument("--skip-audio", action="store_true",
+                    help="generate silent video (LTX-2.3 makes synced audio by default; video pixels are byte-identical either way)")
+    ap.add_argument("--prompts-file",
+                    help="batch: a text file with one prompt per line (i2v/t2v/keyframe). Loops over them reusing the warm container — only the first pays cold start. Saves one mp4 per prompt.")
     ap.add_argument("--app", default="ltx2-fast-inference")
     ap.add_argument("--out-dir", default="./video_out")
     args = ap.parse_args()
@@ -101,8 +105,55 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
 
-    print(f"[ltx2-video] mode={args.mode} app={args.app} frames={args.frames} {args.width}x{args.height}")
+    print(f"[ltx2-video] mode={args.mode} app={args.app} frames={args.frames} {args.width}x{args.height} audio={'off' if args.skip_audio else 'on'}")
     print("[ltx2-video] first call is a cold start (~90s); warm calls are ~7-9s.")
+
+    def _save(res, tag):
+        b = res.get("video_b64") if isinstance(res, dict) else None
+        if not b:
+            print(f"WARN: no video for {tag}: {res}")
+            return None
+        f = out / f"{tag}.mp4"
+        f.write_bytes(base64.b64decode(b))
+        print(f"SAVED {f}  ({res.get('video_bytes')} B, latency {res.get('latency_s')}s)")
+        png = f.with_suffix(".png")
+        try:
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(f),
+                            "-vf", "select=eq(n\\,1)", "-vframes", "1", str(png)],
+                           check=False, timeout=30)
+            if png.is_file():
+                print(f"PREVIEW {png}")
+        except Exception:
+            pass
+        return f
+
+    # ---- Batch: one prompt per line, reuse the warm container (only #1 cold-starts) ----
+    if args.prompts_file:
+        if args.mode not in ("i2v", "t2v", "keyframe"):
+            sys.exit("ERROR: --prompts-file supports i2v / t2v / keyframe only")
+        prompts = [ln.strip() for ln in pathlib.Path(args.prompts_file).expanduser().read_text().splitlines() if ln.strip()]
+        if not prompts:
+            sys.exit(f"ERROR: no prompts in {args.prompts_file}")
+        if args.mode == "i2v":
+            if not args.image:
+                sys.exit("ERROR: --image required for i2v batch")
+            image_b64 = _b64(args.image[0])
+        elif args.mode == "keyframe":
+            if len(args.image) < 2:
+                sys.exit("ERROR: keyframe batch needs two --image args")
+            image_b64 = [_b64(args.image[0]), _b64(args.image[1])]
+        else:
+            image_b64 = []
+        print(f"[ltx2-video] BATCH {len(prompts)} prompts (warm-reused after the first)")
+        for i, p in enumerate(prompts):
+            print(f"[ltx2-video] batch {i+1}/{len(prompts)}: {p[:70]}")
+            res = m.smoke_generate.remote(
+                height=args.height, width=args.width, num_frames=args.frames,
+                num_inference_steps=args.steps, prompt=p, image_b64=image_b64,
+                return_video_b64=True, skip_audio=args.skip_audio,
+            )
+            _save(res, f"{ts}_{args.mode}_{i:02d}")
+        return
 
     if args.mode == "v2v":
         if not args.video:
@@ -144,27 +195,11 @@ def main() -> None:
             height=args.height, width=args.width, num_frames=args.frames,
             num_inference_steps=args.steps, prompt=args.prompt,
             image_b64=image_b64, return_video_b64=True,
+            skip_audio=args.skip_audio,
         )
 
-    b64 = res.get("video_b64") if isinstance(res, dict) else None
-    if not b64:
+    if not _save(res, f"{ts}_{args.mode}"):
         sys.exit(f"ERROR: no video returned: {res}")
-    mp4 = out / f"{ts}_{args.mode}.mp4"
-    mp4.write_bytes(base64.b64decode(b64))
-    print(f"SAVED {mp4}  ({res.get('video_bytes')} B, latency {res.get('latency_s')}s)")
-
-    # Best-effort preview frame (needs ffmpeg).
-    png = out / f"{ts}_{args.mode}.png"
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp4),
-             "-vf", "select=eq(n\\,1)", "-vframes", "1", str(png)],
-            check=False, timeout=30,
-        )
-        if png.is_file():
-            print(f"PREVIEW {png}")
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":

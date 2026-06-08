@@ -117,6 +117,21 @@ before running (see references/mode_ux.md §3.3-B) and offer to make B a variant
 the clarifying AskUserQuestion prompts, and per-mode latency** live in
 `references/mode_ux.md` — read it when choosing a mode or expanding a motion prompt.
 
+## Audio & batching
+
+- **Audio is ON by default.** LTX-2.3 generates **synced audio** with the video. So
+  put the *sound* in your prompt too — ambience, foley, a music mood (e.g. "rain
+  patter and distant thunder", "soft lo-fi pad", "crowd murmur"). The model scores
+  the audio from the same prompt.
+- **Silent clip:** add `--skip-audio`. The **video pixels are byte-identical** with
+  or without audio — skipping only drops the audio decode (slightly faster, smaller
+  file). Use it for B-roll you'll score later, or when audio isn't wanted.
+- **Batching:** `--prompts-file prompts.txt` (one prompt per line; i2v / t2v /
+  keyframe) loops over all prompts **in one warm container** — only the first pays
+  the cold start, the rest are warm. Saves one mp4 per line (`<ts>_<mode>_NN.mp4`).
+  Great for exploring 10–20 prompt variants cheaply. For i2v/keyframe pass the
+  `--image`(s) once; they apply to every prompt in the batch.
+
 ## Guardrails
 
 - Always confirm via AskUserQuestion before a full run (GPU cost). Offer the cheap smoke first.
