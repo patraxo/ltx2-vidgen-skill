@@ -11,7 +11,7 @@
 
 ![demo](assets/demo.gif)
 
-*Neon UGC clip, image-to-video on RTX PRO 6000 (Blackwell, 96 GB, bf16). Warm generation ~7–9 s.*
+*Side-by-side image-to-video — slow push-in, neon grade. LTX-2.3 (22B) on RTX PRO 6000 (Blackwell, 96 GB, bf16). [▶ full-quality mp4](assets/demo.mp4)*
 
 ---
 
