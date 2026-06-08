@@ -30,54 +30,41 @@ A **Claude Code skill that owns the whole loop** — it deploys your own LTX-2.3
 
 ---
 
-## Quickstart — deploy
+## Install
+
+**1. Install the skill** (Claude Code, or any agent that reads `SKILL.md`):
 
 ```bash
-# install uv (https://docs.astral.sh/uv), then:
-uv sync
-uv run modal token new      # one-time auth
-./deploy.sh                 # deploys the app (no secrets to set up)
+npx skills add patraxo/ltx2-vidgen-skill        # or: cp -R skills/ltx2-video ~/.claude/skills/
+pip install modal && modal token new            # Modal SDK + your account (free — $30/mo credits)
 ```
 
-First build downloads the LTX-2.3 weights + Gemma text encoder into a Modal volume (public components only — no HuggingFace token). Cached on every later deploy.
+**2. Deploy your backend once** — into *your* Modal account (downloads the LTX-2.3 weights + Gemma text encoder; public components only, no HuggingFace token):
 
 ```bash
-# image-to-video from a real photo
-PYTHONPATH=. uv run modal run deploy/ltx2_model.py::smoke_real --image-path pic.jpg
-# t2v + i2v + keyframe (saved to deploy/mode_clips/)
-PYTHONPATH=. uv run modal run deploy/ltx2_model.py::run_modes
-# video-to-video retake
-PYTHONPATH=. uv run modal run deploy/ltx2_model.py::run_retake
-# keyframe interpolation between two images
+git clone https://github.com/patraxo/ltx2-vidgen-skill && cd ltx2-vidgen-skill && ./deploy.sh
+```
+
+That's it. Now in Claude Code, drop a photo (or just describe a scene) and ask:
+
+- *"turn this photo into a video, subtle natural motion"* — image → **i2v**
+- *"interpolate between these two frames"* — two images → **keyframe**
+- *"restyle the middle of this clip"* — a video → **v2v**
+- *"generate a neon city street, vertical reel"* — prompt only → **t2v**
+- *"follow the edges of this clip"* — a control render → **IC-LoRA control**
+
+The skill validates the input, confirms cost (offers a cheap smoke first), calls your deployed app via `modal.Cls.from_name` (no endpoint, no auth, no secrets), and saves the `.mp4` + a preview frame to `./video_out/`. First clip cold-starts ~90 s; warm ~31 s.
+
+<details><summary>Prefer raw <code>modal run</code>? Drive the backend directly, no skill</summary>
+
+```bash
+PYTHONPATH=. uv run modal run deploy/ltx2_model.py::smoke_real --image-path pic.jpg   # i2v
+PYTHONPATH=. uv run modal run deploy/ltx2_model.py::run_modes                          # t2v + i2v + keyframe
+PYTHONPATH=. uv run modal run deploy/ltx2_model.py::run_retake                         # v2v
 PYTHONPATH=. uv run modal run deploy/ltx2_model.py::kf_real --image-a a.jpg --image-b b.jpg
-# tiny smoke + full verification
-PYTHONPATH=. uv run modal run tests/smoke_test.py
-PYTHONPATH=. uv run modal run tests/ship_verify.py
+PYTHONPATH=. uv run modal run tests/ship_verify.py                                     # full verify
 ```
-
-First clip cold-starts ~90 s; every warm clip after is 7–9 s.
-
----
-
-## Quickstart — Claude Code skill
-
-Drop a photo in Claude Code, ask for a video.
-
-```bash
-# 1. deploy the backend (above) — the skill calls it by Modal app name (`ltx2-fast-inference`), no endpoint URL needed
-# 2. install the skill (one-time)
-cp -R skills/ltx2-video ~/.claude/skills/ltx2-video
-pip install modal && modal token new      # the skill's script needs the Modal SDK
-```
-
-Then in Claude Code, just say:
-
-- *"turn this photo into a video, subtle natural motion"* (attach an image → **i2v**)
-- *"interpolate between these two frames"* (two images → **keyframe**)
-- *"retake the middle of this clip with more motion"* (a video → **v2v**)
-- *"generate a video of a neon city street, vertical reel"* (no image → **t2v**)
-
-The skill resolves + validates the image, confirms the cost (cold-start/cheap-smoke-first), calls the deployed app, and saves the `.mp4` + a preview frame to `./video_out/`. Under the hood it runs `skills/ltx2-video/scripts/submit_video.py`, which calls `modal.Cls.from_name("ltx2-fast-inference", "Model")` — no HTTP endpoint, no auth.
+</details>
 
 ---
 

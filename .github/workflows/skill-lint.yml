@@ -1,0 +1,55 @@
+name: skill-lint
+
+# Validates every skills/<name>/SKILL.md: YAML frontmatter present, `name`
+# matches the parent directory, and `description` is non-empty. Also syntax-checks
+# the deploy app + the skill's submit script. Keeps the published skill installable.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Lint SKILL.md frontmatter
+        run: |
+          python3 - <<'PY'
+          import glob, sys, re
+          fails = []
+          skills = glob.glob("skills/*/SKILL.md")
+          if not skills:
+              fails.append("no skills/*/SKILL.md found")
+          for p in skills:
+              d = p.split("/")[1]
+              text = open(p, encoding="utf-8").read()
+              m = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.S)
+              if not m:
+                  fails.append(f"{p}: missing YAML frontmatter"); continue
+              fm = m.group(1)
+              name = re.search(r"^name:\s*(.+)$", fm, re.M)
+              desc = re.search(r"^description:\s*(.+)$", fm, re.M)
+              if not name:
+                  fails.append(f"{p}: no `name:` field")
+              elif name.group(1).strip().strip('"\'') != d:
+                  fails.append(f"{p}: name '{name.group(1).strip()}' != dir '{d}'")
+              if not desc or not desc.group(1).strip():
+                  fails.append(f"{p}: empty/missing `description:`")
+              print(f"checked {p}")
+          if fails:
+              print("\nFRONTMATTER ERRORS:"); [print(" -", f) for f in fails]; sys.exit(1)
+          print("\nall SKILL.md frontmatter valid")
+          PY
+
+      - name: Syntax-check Python
+        run: |
+          python3 -m py_compile deploy/ltx2_model.py
+          python3 -m py_compile skills/ltx2-video/scripts/submit_video.py
+          echo "python syntax OK"
