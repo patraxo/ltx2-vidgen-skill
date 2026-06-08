@@ -1,17 +1,21 @@
-# ltx2-claude-skill
+<h1 align="center">ltx2-vidgen-skill</h1>
 
-![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Serverless](https://img.shields.io/badge/serverless-Modal-7C3AED)
-![Model](https://img.shields.io/badge/model-LTX--2.3%20·%2022B-FF4088)
-![GPU](https://img.shields.io/badge/GPU-RTX%20PRO%206000-76B900?logo=nvidia&logoColor=white)
-![Precision](https://img.shields.io/badge/precision-bf16-0A7E8C)
-![uv](https://img.shields.io/badge/packaging-uv-DE5FE9)
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/serverless-Modal-7C3AED" alt="Modal">
+  <img src="https://img.shields.io/badge/model-LTX--2.3%20·%2022B-FF4088" alt="LTX-2.3">
+  <img src="https://img.shields.io/badge/GPU-RTX%20PRO%206000-76B900?logo=nvidia&logoColor=white" alt="GPU">
+  <img src="https://img.shields.io/badge/precision-bf16-0A7E8C" alt="bf16">
+  <img src="https://img.shields.io/badge/packaging-uv-DE5FE9" alt="uv">
+</p>
 
-> **Own your AI video pipeline.** Self-hosted, optimized LTX-2.3 (22B) on serverless GPU — text-to-video, image-to-video, keyframe interpolation, and video-to-video for a few cents a clip, no per-clip API meter, no rate limit. Ships as a **Claude Code skill** too: drop a photo in Claude Code → get a video.
+> **Own your AI video pipeline.** Self-hosted, optimized LTX-2.3 (22B) on serverless GPU — text-to-video, image-to-video, keyframe interpolation, video-to-video, and IC-LoRA (canny/depth/pose) control, with synced audio, for a few cents a clip — no per-clip API meter, no rate limit. Ships as a **Claude Code skill** too: drop a photo in Claude Code → get a video.
 
-![demo](assets/demo.gif)
+<p align="center">
+  <img src="assets/demo.gif" width="540" alt="LTX-2.3 image-to-video demo">
+</p>
 
-*Side-by-side image-to-video — slow push-in, neon grade. LTX-2.3 (22B) on RTX PRO 6000 (Blackwell, 96 GB, bf16). [▶ full-quality mp4](assets/demo.mp4)*
+<p align="center"><em>Side-by-side image-to-video — two stills brought to life (slow push-in + wind-blown hair). LTX-2.3 (22B) on RTX PRO 6000 (Blackwell, 96 GB, bf16). <a href="assets/demo.mp4">▶ full-quality mp4</a></em></p>
 
 ---
 
