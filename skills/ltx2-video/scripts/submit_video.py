@@ -87,6 +87,9 @@ def main() -> None:
     ap.add_argument("--end", type=float, default=5.0, help="v2v: window end (s)")
     ap.add_argument("--skip-audio", action="store_true",
                     help="generate silent video (LTX-2.3 makes synced audio by default; video pixels are byte-identical either way)")
+    ap.add_argument("--seed", type=int, default=0, help="base seed (a fixed seed reproduces a clip)")
+    ap.add_argument("--variations", type=int, default=1,
+                    help="batch: generate N takes of the SAME prompt with seeds seed..seed+N-1 (i2v/t2v/keyframe). 'run it 20 ways, keep 1' — only the first take cold-starts.")
     ap.add_argument("--prompts-file",
                     help="batch: a text file with one prompt per line (i2v/t2v/keyframe). Loops over them reusing the warm container — only the first pays cold start. Saves one mp4 per prompt.")
     ap.add_argument("--app", default="ltx2-fast-inference")
@@ -127,42 +130,19 @@ def main() -> None:
             pass
         return f
 
-    # ---- Batch: one prompt per line, reuse the warm container (only #1 cold-starts) ----
-    if args.prompts_file:
-        if args.mode not in ("i2v", "t2v", "keyframe"):
-            sys.exit("ERROR: --prompts-file supports i2v / t2v / keyframe only")
-        prompts = [ln.strip() for ln in pathlib.Path(args.prompts_file).expanduser().read_text().splitlines() if ln.strip()]
-        if not prompts:
-            sys.exit(f"ERROR: no prompts in {args.prompts_file}")
-        if args.mode == "i2v":
-            if not args.image:
-                sys.exit("ERROR: --image required for i2v batch")
-            image_b64 = _b64(args.image[0])
-        elif args.mode == "keyframe":
-            if len(args.image) < 2:
-                sys.exit("ERROR: keyframe batch needs two --image args")
-            image_b64 = [_b64(args.image[0]), _b64(args.image[1])]
-        else:
-            image_b64 = []
-        print(f"[ltx2-video] BATCH {len(prompts)} prompts (warm-reused after the first)")
-        for i, p in enumerate(prompts):
-            print(f"[ltx2-video] batch {i+1}/{len(prompts)}: {p[:70]}")
-            res = m.smoke_generate.remote(
-                height=args.height, width=args.width, num_frames=args.frames,
-                num_inference_steps=args.steps, prompt=p, image_b64=image_b64,
-                return_video_b64=True, skip_audio=args.skip_audio,
-            )
-            _save(res, f"{ts}_{args.mode}_{i:02d}")
-        return
-
     if args.mode == "v2v":
         if not args.video:
             sys.exit("ERROR: --video required for v2v")
         res = m.smoke_retake.remote(
             video_b64=_b64(args.video), prompt=args.prompt,
-            start_time=args.start, end_time=args.end, num_inference_steps=args.steps,
+            start_time=args.start, end_time=args.end,
+            num_inference_steps=args.steps, seed=args.seed,
         )
-    elif args.mode == "control":
+        if not _save(res, f"{ts}_v2v"):
+            sys.exit(f"ERROR: no video returned: {res}")
+        return
+
+    if args.mode == "control":
         # Resolve the control render: explicit --control-video, else derive canny from --video.
         if args.control_video:
             control_b64 = _b64(args.control_video)
@@ -178,28 +158,58 @@ def main() -> None:
         res = m.smoke_control.remote(
             control=args.control, control_video_b64=control_b64, image_b64=init_b64,
             prompt=args.prompt, num_frames=args.frames, height=args.height, width=args.width,
-            control_strength=args.control_strength,
+            control_strength=args.control_strength, seed=args.seed,
         )
-    else:
-        if args.mode == "i2v":
-            if not args.image:
-                sys.exit("ERROR: --image required for i2v")
-            image_b64 = _b64(args.image[0])
-        elif args.mode == "keyframe":
-            if len(args.image) < 2:
-                sys.exit("ERROR: keyframe needs two --image args (A and B)")
-            image_b64 = [_b64(args.image[0]), _b64(args.image[1])]
-        else:  # t2v
-            image_b64 = []  # empty -> no image conditioning
-        res = m.smoke_generate.remote(
-            height=args.height, width=args.width, num_frames=args.frames,
-            num_inference_steps=args.steps, prompt=args.prompt,
-            image_b64=image_b64, return_video_b64=True,
-            skip_audio=args.skip_audio,
-        )
+        if not _save(res, f"{ts}_control"):
+            sys.exit(f"ERROR: no video returned: {res}")
+        return
 
-    if not _save(res, f"{ts}_{args.mode}"):
-        sys.exit(f"ERROR: no video returned: {res}")
+    # ---- generate modes (i2v / t2v / keyframe): prompt-batch × seed-variations ----
+    # All jobs run in ONE warm container — only the first pays the cold start.
+    if args.mode == "i2v":
+        if not args.image:
+            sys.exit("ERROR: --image required for i2v")
+        image_b64 = _b64(args.image[0])
+    elif args.mode == "keyframe":
+        if len(args.image) < 2:
+            sys.exit("ERROR: keyframe needs two --image args (A and B)")
+        image_b64 = [_b64(args.image[0]), _b64(args.image[1])]
+    else:  # t2v
+        image_b64 = []  # empty -> no image conditioning
+
+    if args.prompts_file:
+        prompts = [ln.strip() for ln in pathlib.Path(args.prompts_file).expanduser().read_text().splitlines() if ln.strip()]
+        if not prompts:
+            sys.exit(f"ERROR: no prompts in {args.prompts_file}")
+    else:
+        prompts = [args.prompt]
+    seeds = list(range(args.seed, args.seed + max(1, args.variations)))
+    total = len(prompts) * len(seeds)
+    if total > 1:
+        print(f"[ltx2-video] BATCH {len(prompts)} prompt(s) × {len(seeds)} seed(s) = {total} clips (warm-reused after #1)")
+
+    n = saved = 0
+    for pi, p in enumerate(prompts):
+        for sd in seeds:
+            n += 1
+            if total > 1:
+                print(f"[ltx2-video] {n}/{total} (prompt {pi+1}, seed {sd}): {p[:60]}")
+            res = m.smoke_generate.remote(
+                height=args.height, width=args.width, num_frames=args.frames,
+                num_inference_steps=args.steps, prompt=p, image_b64=image_b64,
+                return_video_b64=True, skip_audio=args.skip_audio, seed=sd,
+            )
+            tag = f"{ts}_{args.mode}"
+            if len(prompts) > 1:
+                tag += f"_p{pi:02d}"
+            if len(seeds) > 1:
+                tag += f"_s{sd}"
+            if _save(res, tag):
+                saved += 1
+    if saved == 0:
+        sys.exit("ERROR: no videos produced")
+    if total > 1:
+        print(f"[ltx2-video] done: {saved}/{total} saved to {out}")
 
 
 if __name__ == "__main__":

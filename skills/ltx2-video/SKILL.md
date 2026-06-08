@@ -126,11 +126,23 @@ the clarifying AskUserQuestion prompts, and per-mode latency** live in
 - **Silent clip:** add `--skip-audio`. The **video pixels are byte-identical** with
   or without audio — skipping only drops the audio decode (slightly faster, smaller
   file). Use it for B-roll you'll score later, or when audio isn't wanted.
-- **Batching:** `--prompts-file prompts.txt` (one prompt per line; i2v / t2v /
-  keyframe) loops over all prompts **in one warm container** — only the first pays
-  the cold start, the rest are warm. Saves one mp4 per line (`<ts>_<mode>_NN.mp4`).
-  Great for exploring 10–20 prompt variants cheaply. For i2v/keyframe pass the
-  `--image`(s) once; they apply to every prompt in the batch.
+- **Batching — two kinds, both in one warm container (only the first take cold-starts):**
+  - **Multiple passes of the same prompt** — `--variations N` runs N takes with seeds
+    `seed..seed+N-1`. This is the "run a prompt 20 ways, keep the 1 good one" loop —
+    fail-free iteration. Files: `<ts>_<mode>_s<seed>.mp4`. Pair with `--seed` to set
+    the base / reproduce a take.
+  - **Multiple different prompts** — `--prompts-file prompts.txt` (one prompt per line;
+    i2v / t2v / keyframe). Files: `<ts>_<mode>_pNN.mp4`. For i2v/keyframe pass the
+    `--image`(s) once — they apply to every prompt.
+  - **They compose:** N prompts × M variations = N×M clips in one warm run. Cost scales
+    with clip count; each clip is still a few cents. Suggest a cheap-smoke pass
+    (`--frames 17 --height 320 --width 512 --steps 8 --variations 8`) to scan directions
+    before committing to full-res takes.
+  ```bash
+  # 8 takes of one prompt to find a keeper
+  uv run --with modal python3 ${CLAUDE_SKILL_DIR}/scripts/submit_video.py \
+    --mode i2v --image "<abs>" --prompt "<prompt>" --variations 8
+  ```
 
 ## Guardrails
 
