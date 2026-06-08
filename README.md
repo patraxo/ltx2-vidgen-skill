@@ -149,6 +149,10 @@ Helper modules live in `utils/` and are mounted into the container.
 | `LTX_CACHE_TEXT_EMB` | `1` | LRU cache on the text encoder output. |
 | `LTX_SKIP_AUDIO` | `0` | Per-request default for skipping audio decode (video pixels byte-identical). |
 | `LTX_FP8` | `0` | Load official fp8 weights instead of bf16 (off = bf16 quality default). |
+| `LTX_VAE_TILE_PX` | `768` | VAE-decode spatial tile size (px, ≥64 & ÷32). Smaller → smaller decode peak (measured ~1 GB lever; decode is already well-tiled). Overlap blends seams. |
+| `LTX_VAE_TILE_OVERLAP` | `64` | Spatial tile overlap (px, ÷32, < tile). |
+| `LTX_VAE_TEMPORAL_FRAMES` | `80` | VAE-decode temporal chunk (frames, ≥16 & ÷8). |
+| `LTX_VAE_TEMPORAL_OVERLAP` | `24` | Temporal chunk overlap (frames, ÷8, < chunk). |
 
 ---
 

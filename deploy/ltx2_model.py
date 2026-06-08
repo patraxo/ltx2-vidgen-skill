@@ -363,6 +363,45 @@ def _free_all_residents() -> None:
             break
 
 
+# VAE-decode tiling. The decode of the final latent back to pixels is the
+# activation spike that scales with height*width*frames (the ~24 GB term in the
+# 2*35+24=94 GB OOM). LTX's TilingConfig.default() = spatial 768px/64 overlap,
+# temporal 80 frames/24 overlap. SMALLER tiles shrink the decode peak (bf16-exact
+# up to overlap blend) — letting more transformers stay resident. Env-tunable so
+# the tile size can be tuned/swept without code changes; per-request override
+# (tile_px / temporal_frames) lets a sweep run in one warm container.
+_VAE_TILE_PX = int(os.environ.get("LTX_VAE_TILE_PX", "768"))
+_VAE_TILE_OVERLAP = int(os.environ.get("LTX_VAE_TILE_OVERLAP", "64"))
+_VAE_TEMPORAL_FRAMES = int(os.environ.get("LTX_VAE_TEMPORAL_FRAMES", "80"))
+_VAE_TEMPORAL_OVERLAP = int(os.environ.get("LTX_VAE_TEMPORAL_OVERLAP", "24"))
+
+
+def _make_tiling_config(tile_px=None, temporal_frames=None):
+    """Build a VAE TilingConfig from env defaults with optional per-request
+    overrides. Clamps to LTX's validity rules (spatial: >=64 & /32, overlap /32
+    & < tile; temporal: >=16 & /8, overlap /8 & < tile) so a swept value can
+    never raise. Falls back to TilingConfig.default() on any import/build error."""
+    try:
+        from ltx_core.model.video_vae import TilingConfig
+        from ltx_core.model.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig
+        tp = int(tile_px) if tile_px else _VAE_TILE_PX
+        to = _VAE_TILE_OVERLAP
+        tf = int(temporal_frames) if temporal_frames else _VAE_TEMPORAL_FRAMES
+        tov = _VAE_TEMPORAL_OVERLAP
+        tp = max(64, (tp // 32) * 32)
+        to = min(max(0, (to // 32) * 32), tp - 32)
+        tf = max(16, (tf // 8) * 8)
+        tov = min(max(0, (tov // 8) * 8), tf - 8)
+        return TilingConfig(
+            spatial_config=SpatialTilingConfig(tile_size_in_pixels=tp, tile_overlap_in_pixels=to),
+            temporal_config=TemporalTilingConfig(tile_size_in_frames=tf, tile_overlap_in_frames=tov),
+        )
+    except Exception as _e:
+        print(f"   [VAE-TILE] config build failed ({_e}); falling back to default()")
+        from ltx_core.model.video_vae import TilingConfig
+        return TilingConfig.default()
+
+
 # Per-stage transformer is ~35 GB resident. The two-stage forward also needs an
 # ACTIVATION + audio/VAE/text working set that scales with height*width*frames
 # (measured ~24 GB at 1280x768x97, ~9-10 GB at 512x768x97). On a 96 GB card you
@@ -2502,7 +2541,7 @@ class Model:
         print(f"   Control video: {control_video_url[:80]} (strength={control_strength})")
         print(f"   Resolution: {width}x{height}, Frames: {num_frames}, FPS: {frame_rate}")
 
-        tiling_config = TilingConfig.default()
+        tiling_config = _make_tiling_config()
         video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
 
         inference_start = time.time()
@@ -2856,6 +2895,9 @@ class Model:
         skip_audio: bool | None = None,
         emb_cache: bool | None = None,
         persist_mode: str | None = None,
+        tile_px: int | None = None,
+        temporal_frames: int | None = None,
+        force_lru_max: int | None = None,
     ) -> bytes:
         """Generate video from images.
 
@@ -2915,7 +2957,8 @@ class Model:
         _PERSIST_CURRENT_SHAPE["width"] = width
         # Activation-aware resident cap for THIS request's resolution/frames, so a
         # high-res forward never collides with two resident stage transformers.
-        _PERSIST_STATE["lru_max"] = _max_residents_for(height, width, num_frames)
+        _PERSIST_STATE["lru_max"] = (int(force_lru_max) if force_lru_max
+                                     else _max_residents_for(height, width, num_frames))
         # Proactively drop residents from a DIFFERENT resolution (and any excess
         # over the cap) BEFORE the forward — stops a warm container loaded by a
         # prior different-resolution request from OOMing this one's first call.
@@ -3136,7 +3179,12 @@ class Model:
 
         inference_start = time.time()
 
-        tiling_config = TilingConfig.default()
+        tiling_config = _make_tiling_config(tile_px, temporal_frames)
+        _sp = tiling_config.spatial_config
+        _tp = tiling_config.temporal_config
+        print(f"   [VAE-TILE] spatial={getattr(_sp,'tile_size_in_pixels',None)}/{getattr(_sp,'tile_overlap_in_pixels',None)} "
+              f"temporal={getattr(_tp,'tile_size_in_frames',None)}/{getattr(_tp,'tile_overlap_in_frames',None)} "
+              f"lru_max={_PERSIST_STATE['lru_max']}")
         video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
 
         # HQ pipeline uses LTX_2_3_HQ_PARAMS (stg_scale=0, rescale=0.45);
@@ -3494,6 +3542,9 @@ class Model:
         persist_mode: str | None = None,
         return_video_b64: bool = False,
         image_b64: str | None = None,
+        tile_px: int | None = None,
+        temporal_frames: int | None = None,
+        force_lru_max: int | None = None,
     ) -> dict:
         """Auth-free smoke entrypoint for reorg + optimization-stack verification.
 
@@ -3561,6 +3612,9 @@ class Model:
                 skip_audio=skip_audio,
                 emb_cache=emb_cache,
                 persist_mode=persist_mode,
+                tile_px=tile_px,
+                temporal_frames=temporal_frames,
+                force_lru_max=force_lru_max,
             )
         except Exception as _e:
             # Return the failure as a DIAGNOSTIC dict (don't raise) so the client
@@ -3699,7 +3753,7 @@ class Model:
         video_guider = dc_replace(params.video_guider_params, cfg_scale=cfg_guidance_scale)
         audio_guider = params.audio_guider_params
 
-        tiling_config = TilingConfig.default()
+        tiling_config = _make_tiling_config()
         video_chunks_number = get_video_chunks_number(src.frames, tiling_config)
 
         print(f"\n🧠 Running retake inference...")
