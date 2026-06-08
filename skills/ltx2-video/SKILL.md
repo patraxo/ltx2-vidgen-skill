@@ -94,8 +94,18 @@ methods remotely via `modal.Cls.from_name` (no repo path needed).
 ## Prompting
 
 Subject + action first, then lighting/camera, photorealistic detail; keep it tight.
-Generate native vertical 9:16 (768×1280) for reels — don't render wide and crop.
 Frame counts must be `8k+1` (17, 49, 97, 121, 217, 241). bf16, no quantization.
+
+**Resolution presets (`--format`)** — render native to the target platform, don't
+crop. Default is `reel`.
+
+| `--format` | Aspect | W×H | Use for |
+|---|---|---|---|
+| `reel` / `tiktok` / `shorts` / `vertical` *(default)* | 9:16 | 768×1280 | IG Reels, TikTok, YT Shorts |
+| `youtube` / `landscape` / `wide` | 16:9 | 1280×704 | YouTube, landscape embed |
+| `square` / `post` | 1:1 | 1024×1024 | IG/FB feed post |
+
+`--width/--height` override the preset (must be divisible by 32).
 
 **Image-grounded prompting (i2v) — do this for quality.** Don't make the user
 describe their own photo. First **Read the image** and silently form a one-line

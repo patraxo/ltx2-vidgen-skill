@@ -80,8 +80,11 @@ def main() -> None:
     ap.add_argument("--canny-high", type=float, default=0.2, help="canny derive: upper threshold")
     ap.add_argument("--prompt", default="cinematic, natural motion, photorealistic")
     ap.add_argument("--frames", type=int, default=97, help="num frames (8k+1, e.g. 49/97/121/217)")
-    ap.add_argument("--height", type=int, default=1280)
-    ap.add_argument("--width", type=int, default=768)
+    ap.add_argument("--format", default="reel",
+                    choices=["reel", "tiktok", "shorts", "vertical", "youtube", "landscape", "wide", "square", "post"],
+                    help="resolution preset: reel/tiktok/shorts/vertical=9:16 768×1280 (default); youtube/landscape/wide=16:9 1280×704; square/post=1:1 1024×1024. Overridden by explicit --height/--width.")
+    ap.add_argument("--height", type=int, default=None, help="override the --format height (must be divisible by 32)")
+    ap.add_argument("--width", type=int, default=None, help="override the --format width (must be divisible by 32)")
     ap.add_argument("--steps", type=int, default=25)
     ap.add_argument("--start", type=float, default=2.0, help="v2v: window start (s)")
     ap.add_argument("--end", type=float, default=5.0, help="v2v: window end (s)")
@@ -95,6 +98,19 @@ def main() -> None:
     ap.add_argument("--app", default="ltx2-fast-inference")
     ap.add_argument("--out-dir", default="./video_out")
     args = ap.parse_args()
+
+    # Resolution preset (W, H), all sides divisible by 32. Explicit --width/--height win.
+    _FORMATS = {
+        "reel": (768, 1280), "tiktok": (768, 1280), "shorts": (768, 1280), "vertical": (768, 1280),
+        "youtube": (1280, 704), "landscape": (1280, 704), "wide": (1280, 704),
+        "square": (1024, 1024), "post": (1024, 1024),
+    }
+    fw, fh = _FORMATS[args.format]
+    args.width = args.width if args.width is not None else fw
+    args.height = args.height if args.height is not None else fh
+    for _dim, _v in (("width", args.width), ("height", args.height)):
+        if _v % 32 != 0:
+            sys.exit(f"ERROR: --{_dim} must be divisible by 32 (got {_v})")
 
     try:
         import modal
