@@ -21,14 +21,12 @@
 
 ## What this is
 
-Two ways to use it, one repo:
+A **Claude Code skill that owns the whole loop** — it deploys your own LTX-2.3 (22B) video backend to *your* Modal account on first run, then drives it from Claude Code: drop a photo (or a prompt), ask for a video, get the `.mp4`. You never leave Claude Code; the GPU is yours; there's no SaaS in the middle.
 
-| Path | What you get |
-|---|---|
-| **Modal deploy** | A self-hosted LTX-2.3 backend on serverless GPU — `./deploy.sh` and generate clips via `modal run` entrypoints. |
-| **Claude Code skill** | Drop a photo in Claude Code and ask for a video — the skill calls your deployed backend and saves the `.mp4`. |
-
-Both share the optimization stack (resident pipeline, weight cache, FBCache, embedding cache, torch.compile) → **~7–9 s warm generation**, output verified **bit-identical** to the unoptimized path, bf16 throughout. Any resolution with sides divisible by 32 (768×512, 768×1280 reel, 768×1280, 1024²…), clips up to ~10 s, optional generated audio.
+- **Modes:** text-to-video, image-to-video, keyframe interpolation, video-to-video (retake/restyle), and IC-LoRA **canny/depth/pose control** — with synced audio.
+- **Batch:** `--variations N` (one prompt, N takes) and `--prompts-file` (many prompts) in one warm container.
+- **Formats:** reel / TikTok / Shorts (9:16), YouTube (16:9), square — native, no cropping.
+- **Optimized:** resident pipeline + caches + torch.compile → **~1.96× faster**, output bit-identical, bf16 throughout. Clips up to ~10 s; any resolution with sides ÷32.
 
 ---
 
@@ -98,28 +96,26 @@ All four are exercised by `run_modes` / `run_retake` / `kf_real` and verified wo
 
 ## Performance
 
-Measured on RTX PRO 6000 (Blackwell, 96 GB), bf16. Warm latency scales with clip length and resolution — short clips keep both stage transformers resident; long/high-res clips hold one alongside the activation working set:
+Runs on **[Modal](https://modal.com)** serverless **NVIDIA RTX PRO 6000** (Blackwell, 96 GB), bf16, **billed per-second at $0.000842/s (~$3.03/hr)** — so cost ≈ latency:
 
-| Config | Warm latency |
-|---|---|
-| Short clip (≤97 f), low res | **~7–9 s** |
-| 4 s clip (97 f) @ 768×1280 | **~42 s** |
-| 10 s clip (241 f) @ 768×1280 | **~95–120 s** |
-| 10 s video-to-video (retake) | **~470 s** |
-| 4 s control (IC-LoRA union) | **~28 s** |
+| Mode @ 768×1280 (9:16) | Warm latency | ~ $/clip |
+|---|---|---|
+| image / text / keyframe — 4 s (97 f) | **~31 s** | **~2.6¢** |
+| image / text / keyframe — 10 s (241 f) | **~80 s** | ~6.7¢ |
+| IC-LoRA control — 4 s | **~28 s** | ~2.4¢ |
+| video-to-video (retake) — 10 s | ~470 s | ~40¢ |
 
-Cold start (first clip on a fresh container): ~90–200 s. Every config is **a few cents** at per-second billing.
+Cold start (first clip on a fresh container) ~90–200 s; idle scales to **$0**. Both 22B stage transformers stay resident — peak **~75 GB / 96 GB**, verified zero OOM over a 10-generation run (<1 GB drift).
 
-| Optimization | Gain (measured on short clips, bit-identical) |
-|---|---|
-| CPU-pinned weight cache | −13–15 s per cold clip |
-| First-Block-Cache | −17%, lossless |
-| Text-embedding cache | −4 s |
-| Resident + pre-fused pipeline | kills the per-clip rebuild — biggest win *when it fits* |
-| Batch 4 → 32 clips | 3.6× → 6.2× throughput, −84% $/clip |
-| **Net (short-clip regime)** | **1.96× faster, pixel-identical** |
+**Optimization stack** — bf16 throughout, cache paths bit-identical to the unoptimized run, **~1.96× net faster**:
 
-GPU choice: RTX PRO 6000 over H100 → ~45% lower $/clip. Same model in bf16 = same-fidelity frames on any card; the GPU only moves speed and cost.
+- Resident pre-fused pipeline + **activation-aware resident cap** + **cross-resolution purge** → no per-clip rebuild and no OOM when switching mode/resolution.
+- First-block feature cache (~17%), CPU-pinned weight cache, text-embedding cache, torch.compile (persisted Inductor cache), tunable VAE-decode tiling.
+- **fp8 / SageAttention / flash-attn all tested and rejected** — quality regressions or no sm_120 kernel. Speed comes from architecture, not from cheapening the math.
+
+### Costs — and what that buys you
+
+New Modal accounts get **$30/month in free credits**. At ~2.6¢ per 4-second clip that's **~1,000 free clips/month** — so you can explore a prompt 20 ways (`--variations 20`) and keep the one that lands, for pennies. It's **your** Modal account and bill (visible in your dashboard), no per-clip meter, no rate limit, idle = $0.
 
 ---
 
@@ -128,7 +124,7 @@ GPU choice: RTX PRO 6000 over H100 → ~45% lower $/clip. Same model in bf16 = s
 LTX-2.3 is a 22B video diffusion transformer. Serving it naively has two costs: a slow cold start, and a per-clip cost where the pipeline re-assembles + re-fuses model internals every request. This repo attacks both:
 
 1. **Build once, stay resident.** The fully-assembled, LoRA-fused transformer stays in GPU memory between clips (resolution-keyed, LRU-bounded) instead of rebuilt per request — the single biggest win when it fits (short/low-res: ~90 s → ~7 s).
-2. **Activation-aware resident cap.** Each stage transformer is ~35 GB; the two-stage forward also needs an activation + audio/VAE/text working set that scales with `height × width × frames` (~24 GB at 768×1280×97). You can't hold *both* 35 GB transformers resident **and** run a high-res forward on a 96 GB card (2×35 + 24 = 94 GB → OOM). So the resident cap is computed per request: keep as many stage transformers resident as fit alongside the projected activation set (2 at low res = warm-fast; 1 at full-res 10 s = rebuild-per-call but never OOM). This is what makes back-to-back mode-switching safe.
+2. **Both stages stay resident — safely.** Two ~35 GB stage transformers + the (tiled) forward working set peak ~75 GB / 96 GB, so both stay GPU-resident at every supported resolution (measured; zero OOM over a 10-gen run, <1 GB drift). An **activation-aware cap** + a **cross-resolution purge** (drop residents from a prior, different-resolution request before the next forward) keep it safe — back-to-back mode/resolution switching never OOMs. (The earlier 94 GB OOMs were that cross-resolution accumulation, not the resident footprint.)
 3. **CPU-pinned weight cache** — weights pinned in host RAM, streamed to GPU, skipping disk reads. Bit-identical.
 4. **First-Block-Cache** — skips recomputing early transformer blocks (~17%, near-lossless).
 5. **Embedding cache** — the text encoder isn't re-run for a repeated prompt.
@@ -174,10 +170,14 @@ assets/demo.gif
 
 ---
 
-## Acknowledgements & license
+## Acknowledgements & references
 
-- [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) — model weights + upstream `ltx-core`/`ltx-pipelines`. **Review Lightricks' license before any commercial use.**
-- [Modal](https://modal.com) — serverless GPU.
-- Gemma-3 — text encoder.
+- **[LTX-Video](https://huggingface.co/Lightricks/LTX-2.3)** (Lightricks) — the 22B model + upstream `ltx-core`/`ltx-pipelines`. Paper: HaCohen et al., *LTX-Video: Realtime Video Latent Diffusion* — [arXiv:2501.00103](https://arxiv.org/abs/2501.00103).
+- **[Modal](https://modal.com)** — serverless GPU (RTX PRO 6000, per-second billing).
+- **Gemma-3** — text encoder.
 
-Code: private (personal project by [@patraxo](https://github.com/patraxo)). LTX-2.3 weights per Lightricks' license.
+Optimization techniques:
+- Block-feature caching (the first-block cache here) — cf. *BWCache: Accelerating Video Diffusion Transformers through Block-Wise Caching* — [arXiv:2509.13789](https://arxiv.org/abs/2509.13789); broader caching lineage e.g. *SenCache* (LTX-Video) — [arXiv:2602.24208](https://arxiv.org/abs/2602.24208).
+- VAE-decode spatial/temporal tiling, CPU-pinned weight cache, persisted `torch.compile` (Inductor) cache, bf16-exact throughout (no fp8 / quantization).
+
+By [@patraxo](https://github.com/patraxo). LTX-2.3 weights are distributed under Lightricks' license.

@@ -402,28 +402,29 @@ def _make_tiling_config(tile_px=None, temporal_frames=None):
         return TilingConfig.default()
 
 
-# Per-stage transformer is ~35 GB resident. The two-stage forward also needs an
-# ACTIVATION + audio/VAE/text working set that scales with height*width*frames
-# (measured ~24 GB at 1280x768x97, ~9-10 GB at 512x768x97). On a 96 GB card you
-# cannot hold BOTH 35 GB stage transformers resident AND run a high-res forward:
-# 2*35 + 24 = 94 GB -> OOM (verified 2026-06-08: warm i2v at 1280x768 hit
-# 93.96/95 GB with 2 residents). Cold generation only fits because the stages
-# build sequentially (stage_2 isn't resident while stage_1 runs). So the resident
-# cap MUST be activation-aware: keep as many stage transformers resident as fit
-# alongside the projected forward working set. At 1280x768x97 -> 1 (rotates the
-# two stages, slower warm but never OOM); at <=512 height -> 2 (both resident,
-# fast warm). Never exceed _PERSIST_LRU_MAX. LTX_VRAM_USABLE_GB / LTX_XFMR_GB let
-# the math be retuned without code changes.
+# Per-stage transformer is ~35 GB resident. The two-stage forward's extra
+# working set (activation + audio/VAE/text) is SMALL and nearly flat because the
+# VAE decode is tiled (TilingConfig.default 768/80): MEASURED ~5 GB — 2 residents
+# at 768x1280x97 peak 74.3 GB, and even at 241f (10 s) only 75.6 GB, both with
+# ~20 GB free and a 10-gen longevity run showing <1 GB creep, zero OOM
+# (verified 2026-06-08 clean-container sweep). So BOTH stage transformers fit
+# resident at every supported resolution → cap = 2 (warm ~31 s). The earlier
+# "94 GB OOM" was memory ACCUMULATION + cross-resolution stale residents on
+# long-lived warm containers (now handled by _purge_stale_residents), NOT the
+# inherent footprint. The estimate keeps a gentle taper so an extreme resolution
+# would still drop to 1 for safety. LTX_VRAM_USABLE_GB / LTX_XFMR_GB tune it.
 _VRAM_USABLE_GB = float(os.environ.get("LTX_VRAM_USABLE_GB", "91"))
 _XFMR_GB = float(os.environ.get("LTX_XFMR_GB", "35"))
 
 
 def _max_residents_for(height: int, width: int, num_frames: int) -> int:
-    """How many ~35 GB stage transformers can stay resident alongside this
-    request's projected activation working set. Clamped to [1, _PERSIST_LRU_MAX]."""
+    """How many ~35 GB stage transformers fit resident alongside this request's
+    (small, tiled) working set. Clamped to [1, _PERSIST_LRU_MAX]. Calibrated to
+    the measured ~5 GB extras (flat under tiled decode), so all supported
+    resolutions return 2; only an extreme resolution tapers to 1."""
     try:
         mpx_frames = (float(height) * float(width) * float(num_frames)) / 1.0e6
-        extras_gb = 0.25 * mpx_frames + 4.0  # activation + audio/VAE/text + margin
+        extras_gb = 0.02 * mpx_frames + 8.0  # measured ~5GB + margin; nearly flat (tiled decode)
         n = int((_VRAM_USABLE_GB - extras_gb) / _XFMR_GB)
     except Exception:
         n = 1
