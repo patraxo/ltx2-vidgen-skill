@@ -38,11 +38,17 @@ def _b64(path: str) -> str:
     return base64.b64encode(p.read_bytes()).decode("ascii")
 
 
-def _derive_canny(src: str, out_dir: pathlib.Path, frames: int, w: int, h: int) -> str:
+def _derive_canny(src: str, out_dir: pathlib.Path, frames: int, w: int, h: int,
+                  low: float = 0.05, high: float = 0.2) -> str:
     """Render a CANNY edge-map control video from a source clip via ffmpeg
     edgedetect (no model needed). Returns the path to the temp control mp4.
-    Depth/pose control renders need their own models — supply those via
-    --control-video instead."""
+
+    Threshold defaults are DENSE (low=0.05, high=0.2): sparse canny (e.g.
+    low=0.1/high=0.4 on a soft-lit face) yields only a hair outline, which is
+    too weak a control signal — the model drifts (back-of-head / wrong pose).
+    Denser edges capture eyes/nose/mouth/jaw so the output actually follows the
+    structure. Tune via --canny-low / --canny-high. Depth/pose renders need
+    their own models — supply those via --control-video instead."""
     sp = pathlib.Path(src).expanduser()
     if not sp.is_file():
         sys.exit(f"ERROR: source video not found: {sp}")
@@ -50,7 +56,7 @@ def _derive_canny(src: str, out_dir: pathlib.Path, frames: int, w: int, h: int) 
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(sp),
         "-frames:v", str(frames),
-        "-vf", f"scale={w}:{h},edgedetect=low=0.1:high=0.4,format=yuv420p",
+        "-vf", f"scale={w}:{h},edgedetect=low={low}:high={high},format=yuv420p",
         "-an", str(cv),
     ]
     r = subprocess.run(cmd, check=False, timeout=120)
@@ -70,6 +76,8 @@ def main() -> None:
     ap.add_argument("--control-type", default="canny", choices=["canny"],
                     help="how to derive the control render from --video (only canny is auto-derivable; depth/pose need --control-video)")
     ap.add_argument("--control-strength", type=float, default=1.0, help="control adherence (control mode)")
+    ap.add_argument("--canny-low", type=float, default=0.05, help="canny derive: lower threshold (smaller = denser edges)")
+    ap.add_argument("--canny-high", type=float, default=0.2, help="canny derive: upper threshold")
     ap.add_argument("--prompt", default="cinematic, natural motion, photorealistic")
     ap.add_argument("--frames", type=int, default=97, help="num frames (8k+1, e.g. 49/97/121/217)")
     ap.add_argument("--height", type=int, default=1280)
@@ -109,9 +117,10 @@ def main() -> None:
             control_b64 = _b64(args.control_video)
             print(f"[ltx2-video] control={args.control} using supplied control video {args.control_video}")
         elif args.video:
-            cv = _derive_canny(args.video, out, args.frames, args.width, args.height)
+            cv = _derive_canny(args.video, out, args.frames, args.width, args.height,
+                               low=args.canny_low, high=args.canny_high)
             control_b64 = _b64(cv)
-            print(f"[ltx2-video] control={args.control} derived CANNY render from {args.video}")
+            print(f"[ltx2-video] control={args.control} derived CANNY render from {args.video} (low={args.canny_low} high={args.canny_high})")
         else:
             sys.exit("ERROR: control mode needs --control-video (pre-rendered) or --video (to auto-derive canny)")
         init_b64 = _b64(args.image[0]) if args.image else None
