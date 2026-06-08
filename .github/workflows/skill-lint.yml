@@ -53,3 +53,32 @@ jobs:
           python3 -m py_compile deploy/ltx2_model.py
           python3 -m py_compile skills/ltx2-video/scripts/submit_video.py
           echo "python syntax OK"
+
+      - name: Validate plugin marketplace manifest (structural — deterministic gate)
+        run: |
+          python3 - <<'PY'
+          import json, sys, pathlib
+          p = ".claude-plugin/marketplace.json"
+          mp = json.load(open(p))
+          errs = []
+          for k in ("name", "owner", "plugins"):
+              if k not in mp:
+                  errs.append(f"top-level missing `{k}`")
+          for i, pl in enumerate(mp.get("plugins", [])):
+              for k in ("name", "description", "source"):
+                  if k not in pl:
+                      errs.append(f"plugins[{i}] missing `{k}`")
+              # skill-bundle entries must point at real SKILL.md dirs
+              for s in pl.get("skills", []):
+                  d = pathlib.Path(s.lstrip("./"))
+                  if not (d / "SKILL.md").is_file():
+                      errs.append(f"plugins[{i}] skill '{s}' has no SKILL.md")
+          if errs:
+              print("MARKETPLACE ERRORS:"); [print(" -", e) for e in errs]; sys.exit(1)
+          print(f"{p} structurally valid ({len(mp['plugins'])} plugin(s))")
+          PY
+
+      - name: claude plugin validate
+        run: |
+          npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || { echo "::warning::claude CLI install failed; structural check above is the gate"; exit 0; }
+          CI=true claude plugin validate . || { echo "::error::claude plugin validate failed"; exit 1; }
