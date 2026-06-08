@@ -24,7 +24,7 @@ Two ways to use it, one repo:
 | **Modal deploy** | A self-hosted LTX-2.3 backend on serverless GPU — `./deploy.sh` and generate clips via `modal run` entrypoints. |
 | **Claude Code skill** | Drop a photo in Claude Code and ask for a video — the skill calls your deployed backend and saves the `.mp4`. |
 
-Both share the optimization stack (resident pipeline, weight cache, FBCache, embedding cache, torch.compile) → **~7–9 s warm generation**, output verified **bit-identical** to the unoptimized path, bf16 throughout. Any resolution with sides divisible by 32 (768×512, 768×1280 reel, 1280×768, 1024²…), clips up to ~10 s, optional generated audio.
+Both share the optimization stack (resident pipeline, weight cache, FBCache, embedding cache, torch.compile) → **~7–9 s warm generation**, output verified **bit-identical** to the unoptimized path, bf16 throughout. Any resolution with sides divisible by 32 (768×512, 768×1280 reel, 768×1280, 1024²…), clips up to ~10 s, optional generated audio.
 
 ---
 
@@ -99,8 +99,8 @@ Measured on RTX PRO 6000 (Blackwell, 96 GB), bf16. Latency has **two regimes**, 
 | Config | Warm latency | Why |
 |---|---|---|
 | Short clip (≤97 f), low res — 2 transformers cached | **~7–9 s** | both stages resident → no rebuild |
-| 4 s clip (97 f) @ 1280×768 | **~42 s** | activation bigger; eviction starts |
-| 10 s clip (241 f) @ 1280×768 | **~95–120 s** | only 1 transformer fits alongside activation → both stages rebuilt per call |
+| 4 s clip (97 f) @ 768×1280 | **~42 s** | activation bigger; eviction starts |
+| 10 s clip (241 f) @ 768×1280 | **~95–120 s** | only 1 transformer fits alongside activation → both stages rebuilt per call |
 | 10 s video-to-video (retake) | **~470 s** | single-stage full-CFG, the heaviest mode |
 | 4 s control (IC-LoRA union, no init) | **~28 s** | distilled control base is lighter |
 
@@ -126,7 +126,7 @@ GPU choice: RTX PRO 6000 over H100 → ~45% lower $/clip. Same model in bf16 = s
 LTX-2.3 is a 22B video diffusion transformer. Serving it naively has two costs: a slow cold start, and a per-clip cost where the pipeline re-assembles + re-fuses model internals every request. This repo attacks both:
 
 1. **Build once, stay resident.** The fully-assembled, LoRA-fused transformer stays in GPU memory between clips (resolution-keyed, LRU-bounded) instead of rebuilt per request — the single biggest win when it fits (short/low-res: ~90 s → ~7 s).
-2. **Activation-aware resident cap.** Each stage transformer is ~35 GB; the two-stage forward also needs an activation + audio/VAE/text working set that scales with `height × width × frames` (~24 GB at 1280×768×97). You can't hold *both* 35 GB transformers resident **and** run a high-res forward on a 96 GB card (2×35 + 24 = 94 GB → OOM). So the resident cap is computed per request: keep as many stage transformers resident as fit alongside the projected activation set (2 at low res = warm-fast; 1 at full-res 10 s = rebuild-per-call but never OOM). This is what makes back-to-back mode-switching safe.
+2. **Activation-aware resident cap.** Each stage transformer is ~35 GB; the two-stage forward also needs an activation + audio/VAE/text working set that scales with `height × width × frames` (~24 GB at 768×1280×97). You can't hold *both* 35 GB transformers resident **and** run a high-res forward on a 96 GB card (2×35 + 24 = 94 GB → OOM). So the resident cap is computed per request: keep as many stage transformers resident as fit alongside the projected activation set (2 at low res = warm-fast; 1 at full-res 10 s = rebuild-per-call but never OOM). This is what makes back-to-back mode-switching safe.
 3. **CPU-pinned weight cache** — weights pinned in host RAM, streamed to GPU, skipping disk reads. Bit-identical.
 4. **First-Block-Cache** — skips recomputing early transformer blocks (~17%, near-lossless).
 5. **Embedding cache** — the text encoder isn't re-run for a repeated prompt.

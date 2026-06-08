@@ -12,7 +12,7 @@ description: >-
   user's deployed `ltx2-fast-inference` Modal app and saves an .mp4 locally.
   Triggers: "make a video", "animate this photo", "image to video", "i2v",
   "keyframe", "interpolate", "video to video", "retake", "generate a clip/reel".
-argument-hint: "[/abs/path/image.jpg] [\"prompt\"] [i2v|keyframe|v2v|t2v]"
+argument-hint: "[/abs/path/image.jpg] [\"prompt\"] [i2v|keyframe|v2v|t2v|control]"
 allowed-tools: Bash(uv run *) Bash(python3 *) Bash(ffmpeg *) Bash(file *) Bash(realpath *) Bash(test *) Bash(modal token *) Bash(modal app *) Read
 ---
 
@@ -48,7 +48,7 @@ methods remotely via `modal.Cls.from_name` (no repo path needed).
    If not found or not an image, report and stop.
 2. **Confirm before running** (it costs GPU time). Use **AskUserQuestion**:
    - header: `LTX-2.3`
-   - question: `Generate video from <name>? First run cold-starts ~90s; warm ~7–9s; a few cents.`
+   - question: `Generate video from <name>? Cold start ~90–200s. Warm: short/low-res ~7–9s, but full 10s 720p ~1–2 min (v2v ~8 min). A few cents either way.`
    - options:
      - `Quick smoke (cheap)` — low-res sanity check, confirms the container is warm
      - `Full quality` — 97 frames @ 768×1280 (vertical reel)
@@ -98,7 +98,7 @@ Frame counts must be `8k+1` (17, 49, 97, 121, 217). bf16, no quantization.
 ## Guardrails
 
 - Always confirm via AskUserQuestion before a full run (GPU cost). Offer the cheap smoke first.
-- First call after idle cold-starts (~90s); warm calls 7–9s. Use `--timeout 300`.
+- First call after idle cold-starts (~90–200s). Warm latency is resolution-dependent: short/low-res ~7–9s, but full-res 10s clips ~95–120s (v2v ~470s) — at 768×1280 only one stage transformer fits resident, so stages rebuild per call. Use `--timeout 600` for full-res/v2v.
 - Do NOT route through fal-mcp. For Hail Films / @patrawtf canon reels, use the `hail-films-reel` skill instead.
 
 ## Troubleshooting
