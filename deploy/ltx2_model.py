@@ -12,10 +12,13 @@ from fastapi import Body, HTTPException, Request, Response, status
 
 import modal
 
-# Make the repo-root `utils/` package importable — both at deploy time (so
-# add_local_python_source("utils") resolves locally) and inside the container.
+# Make the co-located `deploy/utils/` package importable — both at deploy time
+# (so add_local_python_source("utils") resolves locally) and inside the container.
 import sys as _sys
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEPLOY_DIR = Path(__file__).resolve().parent          # deploy/ — holds utils/
+if str(_DEPLOY_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_DEPLOY_DIR))
+_REPO_ROOT = _DEPLOY_DIR.parent                        # repo root (kept for any root-relative use)
 if str(_REPO_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_REPO_ROOT))
 
