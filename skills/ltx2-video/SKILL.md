@@ -11,7 +11,9 @@ description: >-
   this move", "animate this", "turn these two shots into a transition". Calls the
   user's deployed `ltx2-fast-inference` Modal app and saves an .mp4 locally.
   Triggers: "make a video", "animate this photo", "image to video", "i2v",
-  "keyframe", "interpolate", "video to video", "retake", "generate a clip/reel".
+  "keyframe", "interpolate", "video to video", "retake", "restyle this clip",
+  "generate a clip/reel", "follow this pose/edges/depth", "canny/pose/depth
+  control", "match this motion".
 argument-hint: "[/abs/path/image.jpg] [\"prompt\"] [i2v|keyframe|v2v|t2v|control]"
 allowed-tools: Bash(uv run *) Bash(python3 *) Bash(ffmpeg *) Bash(file *) Bash(realpath *) Bash(test *) Bash(modal token *) Bash(modal app *) Read
 ---
@@ -19,7 +21,7 @@ allowed-tools: Bash(uv run *) Bash(python3 *) Bash(ffmpeg *) Bash(file *) Bash(r
 # ltx2-video — photo → video via self-hosted LTX-2.3
 
 Turns a local image (or two, or a video) into an `.mp4` by calling the user's
-**deployed** `ltx2-fast-inference` Modal app (LTX-2.3, 22B). Four modes:
+**deployed** `ltx2-fast-inference` Modal app (LTX-2.3, 22B). Five modes:
 
 | Mode | Input | What it does |
 |---|---|---|
@@ -93,7 +95,27 @@ methods remotely via `modal.Cls.from_name` (no repo path needed).
 
 Subject + action first, then lighting/camera, photorealistic detail; keep it tight.
 Generate native vertical 9:16 (768×1280) for reels — don't render wide and crop.
-Frame counts must be `8k+1` (17, 49, 97, 121, 217). bf16, no quantization.
+Frame counts must be `8k+1` (17, 49, 97, 121, 217, 241). bf16, no quantization.
+
+**Image-grounded prompting (i2v) — do this for quality.** Don't make the user
+describe their own photo. First **Read the image** and silently form a one-line
+description (subject + setting + lighting), then build the prompt as
+`<image description> , <motion> , <camera>`. Keep the description faithful so
+identity/scene is preserved; only the motion + camera are new. A prompt that
+contradicts the photo (e.g. "golden hour" on a flat-lit indoor face) fights the
+model. Default motion = "subtle idle" if the user gives none.
+
+**Keyframe coherence — the #1 keyframe rule.** Interpolation is only coherent when
+A and B are the **same subject/scene** (same person, slightly different
+pose/expression/camera). Unrelated A/B → a morph/dissolve (identity melt), not a
+clean motion. If the user has only A, offer to make B by **editing A** (same
+subject, one change) for a coherent pair; first/last frames of one clip are also
+coherent by construction; A==B → a smooth loop. If A and B look unrelated, **warn**
+before running (see references/mode_ux.md §3.3-B) and offer to make B a variant of A.
+
+**Named motion presets, the per-mode interaction contracts, the decision tree,
+the clarifying AskUserQuestion prompts, and per-mode latency** live in
+`references/mode_ux.md` — read it when choosing a mode or expanding a motion prompt.
 
 ## Guardrails
 
