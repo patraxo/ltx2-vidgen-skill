@@ -94,19 +94,17 @@ All four are exercised by `run_modes` / `run_retake` / `kf_real` and verified wo
 
 ## Performance
 
-Measured on RTX PRO 6000 (Blackwell, 96 GB), bf16. Latency has **two regimes**, and which one you're in depends on whether two stage transformers can stay resident alongside the forward-pass activation working set:
+Measured on RTX PRO 6000 (Blackwell, 96 GB), bf16. Warm latency scales with clip length and resolution — short clips keep both stage transformers resident; long/high-res clips hold one alongside the activation working set:
 
-| Config | Warm latency | Why |
-|---|---|---|
-| Short clip (≤97 f), low res — 2 transformers cached | **~7–9 s** | both stages resident → no rebuild |
-| 4 s clip (97 f) @ 768×1280 | **~42 s** | activation bigger; eviction starts |
-| 10 s clip (241 f) @ 768×1280 | **~95–120 s** | only 1 transformer fits alongside activation → both stages rebuilt per call |
-| 10 s video-to-video (retake) | **~470 s** | single-stage full-CFG, the heaviest mode |
-| 4 s control (IC-LoRA union, no init) | **~28 s** | distilled control base is lighter |
+| Config | Warm latency |
+|---|---|
+| Short clip (≤97 f), low res | **~7–9 s** |
+| 4 s clip (97 f) @ 768×1280 | **~42 s** |
+| 10 s clip (241 f) @ 768×1280 | **~95–120 s** |
+| 10 s video-to-video (retake) | **~470 s** |
+| 4 s control (IC-LoRA union) | **~28 s** |
 
-Cold start (first clip on a fresh container): ~90–200 s. Every config above is **a few cents** at per-second billing.
-
-**The catch (be honest):** the famous "~9 s warm" only holds for *short, low-res* clips where both stage transformers fit resident. A full 10-second 720p reel can hold only **one** ~35 GB stage transformer next to the ~24 GB activation set on a 96 GB card, so each call rebuilds the stages — ~1–2 min, not 9 s. Still cheap, still self-hosted, just not 9 s.
+Cold start (first clip on a fresh container): ~90–200 s. Every config is **a few cents** at per-second billing.
 
 | Optimization | Gain (measured on short clips, bit-identical) |
 |---|---|
