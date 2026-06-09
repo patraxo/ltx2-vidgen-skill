@@ -156,7 +156,7 @@ Helper modules live in `utils/` and are mounted into the container.
 pyproject.toml             # uv project (client-side dep: Modal SDK)
 deploy.sh                  # one-command deploy
 deploy/ltx2_model.py       # the Modal app: t2v / i2v / keyframe / v2v + opt stack
-utils/                     # helper package (weight registries, FBCache, guiders)
+deploy/utils/                     # helper package (weight registries, FBCache, guiders)
 skills/ltx2-video/         # Claude Code skill (SKILL.md + scripts/submit_video.py)
 tests/                     # smoke_test.py + ship_verify.py
 assets/demo.gif
