@@ -1,12 +1,12 @@
-# Latency fan-out 2026-06-10 — quality-preserving levers only (bf16, NO fp8/fp4)
+# Latency optimization research (June 2026) — quality-preserving levers only (bf16, NO fp8/fp4)
 
-6 research agents (deploy audit, Lightricks official, community Blackwell, Modal
-platform, torch 2.12 sm_120, arxiv 2024-26) + same-container A/B benches.
+Research sweep across six areas (deploy audit, Lightricks upstream, community
+Blackwell reports, Modal platform, torch 2.12 sm_120, arXiv 2024-26) + same-container A/B benches.
 Workload: 768×1280, 121f, 8-step distilled, RTX PRO 6000 (sm_120, 96GB), warm.
 HARD RULE: bf16 only. No fp8, no fp4, no int8 weights, no step cuts. Every
 quantized path in the research = BANNED, none implemented.
 
-## Framing result (arxiv agent)
+## Framing result (literature survey)
 
 **8-step distilled kills step-caching.** Chorus (2604.04451), X-Cache
 (2604.20289), DisCa (2602.05449): distillation already removed inter-step
@@ -82,14 +82,14 @@ look ONLY if upstream exposes codec; not implemented.
 
 ## Sources
 
-Agent reports in session 0eb8c65b (2026-06-10). Key URLs: Lightricks/LTX-2
+Compiled 2026-06-10. Key URLs: Lightricks/LTX-2
 compiling.py + attention.py + memory_efficient_decode.py, issues #208/#27/#37,
 PR #215; ComfyUI PR #13618 (block prefetch, 5090 LTX-2.3 ~14%), PR #13768;
 thu-ml/SpargeAttn#76/#94/#109; pytorch #176426 (sm_120 Triton miscompile,
 OPEN — validate compiled vs eager once); modal.com gpu-mem-snapshots blog;
 arxiv IDs inline above.
 
-## ROUND-2 VERDICTS (2026-06-10, same day — NVENC + batch overlap + Gemma OOM)
+## Follow-up verdicts (2026-06-10 — NVENC + batch overlap + Gemma OOM)
 
 ### NVENC — DEAD on this app (snapshot-restored containers). Evidence chain:
 1. Bare probe app (`probe_nvenc.py`, plain `@app.function`, same image, same
@@ -141,7 +141,7 @@ arxiv IDs inline above.
 - Future (optional): cut the +10 s by backing the streaming builder with the
   cpu_pinned registry if it isn't already; measure first.
 
-### Round-2 measured table (this deploy, warm, 768×1280×121f unless noted)
+### Follow-up measured table (this deploy, warm, 768×1280×121f unless noted)
 | arm | wall | note |
 |---|---|---|
 | fx_base (libx264 ref) | 22.8-23.0 s | inf 19.4-19.6 + enc 2.7 |

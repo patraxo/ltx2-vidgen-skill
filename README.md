@@ -109,7 +109,7 @@ Cold start (first clip on a fresh container) ~90–200 s; idle scales to **$0**.
 
 - Resident pre-fused pipeline + **activation-aware resident cap** + **cross-resolution purge** → no per-clip rebuild and no OOM when switching mode/resolution.
 - First-block feature cache (~17%), CPU-pinned weight cache, text-embedding cache, torch.compile (persisted Inductor cache), tunable VAE-decode tiling.
-- **fp8 / SageAttention / flash-attn all tested and rejected** — fp8: quality rule; flash-attn: no sm_120 kernel; SageAttention 2.2: builds + runs on sm_120 but measured +5% slower here (compile graph breaks — see Research findings). Speed comes from architecture, not from cheapening the math.
+- **fp8 / SageAttention / flash-attn all tested and rejected** — fp8: quality rule; flash-attn: no sm_120 kernel; SageAttention 2.2: builds + runs on sm_120 but measured +5% slower here (compile graph breaks — see Performance research below). Speed comes from architecture, not from cheapening the math.
 
 ### Costs — and what that buys you
 
@@ -158,9 +158,9 @@ Helper modules live in `utils/` and are mounted into the container.
 
 ---
 
-## Research findings (latency fan-out, June 2026)
+## Performance research (June 2026)
 
-A systematic hunt for lossless latency wins on this stack — every lever measured A/B on the same warm container, gated on zero visual loss (blackdetect + PSNR/SSIM + frame inspection + audio). Full write-ups in [`references/`](references/):
+A systematic study of lossless latency levers for this stack — every lever measured A/B on the same warm container, gated on zero visual loss (blackdetect + PSNR/SSIM + frame inspection + audio). Full write-ups in [`references/`](references/):
 
 | Lever | Verdict | Evidence |
 |---|---|---|
@@ -173,7 +173,7 @@ A systematic hunt for lossless latency wins on this stack — every lever measur
 | NVENC encode | ❌ dead under memory snapshots | works in a bare Modal function, fails (`avcodec_open2` UnknownError) in checkpoint-restored containers — in-process **and** in torch-free subprocesses |
 | SpargeAttn, step caches (@8 distilled steps), FA4/xformers, fp8/int8, max-autotune | ❌ rejected | no sm_120 kernels / collapse at 8 steps / quality rule / measured slower |
 
-Floor: a warm 5 s clip is ~19.5 s GPU-bound bf16 DiT + ~2.7 s CPU x264 encode + ~0.5 s overhead. The DiT term only moves with quantization or step cuts — both off the table by the quality rule. Full record: [`references/LATENCY_FANOUT_2026_06_10.md`](references/LATENCY_FANOUT_2026_06_10.md), distilled gotchas in [`references/learnings.md`](references/learnings.md).
+Floor: a warm 5 s clip is ~19.5 s GPU-bound bf16 DiT + ~2.7 s CPU x264 encode + ~0.5 s overhead. The DiT term only moves with quantization or step cuts — both off the table by the quality rule. Full record: [`references/LATENCY_RESEARCH_2026_06.md`](references/LATENCY_RESEARCH_2026_06.md), distilled gotchas in [`references/learnings.md`](references/learnings.md).
 
 Two transferable gotchas worth stealing:
 1. **Inductor captures the SDPA backend at trace time** — benchmarking attention backends with runtime context managers on a compiled model measures nothing.
@@ -190,7 +190,7 @@ deploy/ltx2_model.py       # the Modal app: t2v / i2v / keyframe / v2v + opt sta
 deploy/bench_*.py          # same-container A/B bench drivers (sage, cudnn, matrix, fixes)
 deploy/probe_nvenc.py      # bare-container NVENC probe (no memory snapshot)
 deploy/utils/              # helper package (weight registries, FBCache, guiders)
-references/                # research findings: latency fan-out, sage sm_120, learnings
+references/                # performance research notes (latency study, sage sm_120, learnings)
 skills/ltx2-video/         # Claude Code skill (SKILL.md + scripts/submit_video.py)
 tests/                     # smoke_test.py + ship_verify.py
 assets/demo.gif

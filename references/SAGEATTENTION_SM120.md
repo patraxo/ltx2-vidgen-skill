@@ -1,6 +1,6 @@
 # SageAttention on sm_120 (RTX PRO 6000 Blackwell) × LTX-2.3 — research + decision record
 
-Date: 2026-06-10. Sources: 11 research agents over thu-ml/SageAttention, woct0rdho fork,
+Date: 2026-06-10. Sources: thu-ml/SageAttention, woct0rdho fork,
 ComfyUI core + KJNodes source, Lightricks repos, HF wheel repos, Reddit/community threads.
 
 ## TL;DR
@@ -34,7 +34,7 @@ SageAttention **2.2** (INT8-QK + FP16-PV, CUDA kernels, fp32 PV accumulation) = 
 | PyPI 1.0.6 | ✗ | ✗ | Black output documented. Never use. |
 | 2.1.1 | partial | ✗ | No dedicated sm_120 kernels. |
 | **2.2.0 (source)** | **✓ dedicated kernels** | **✓ (this repo)** | `qk_int_sv_f8_cuda_sm120.cu` etc. ~30-35% on RTX 5090 (Qwen 40-step 14m30s→9m30s); LTX-2.3: 16-24% via KJ node (HF Lightricks/LTX-2.3-nvfp4 discussion #2, RTX 5090 laptop). |
-| 3.0 (FP4) | ✓ (sm_120a is TARGET; sm_100 datacenter unsupported, issue #237) | ✗ py3.13 req + FP4 quality risk | Old memory "won't build sm_120" = wrong env (nvcc 12.4) + wrong arch claim. |
+| 3.0 (FP4) | ✓ (sm_120a is TARGET; sm_100 datacenter unsupported, issue #237) | ✗ py3.13 req + FP4 quality risk | Earlier "won't build sm_120" note = wrong env (nvcc 12.4) + wrong arch claim. |
 
 **Wheels:** no linux torch-2.12+cu130 wheel anywhere (woct0rdho = Windows-only;
 sntdismas SA3 = torch 2.11 ABI → undefined-symbol on 2.12; pseudobacon SA2.2 abi3 =
@@ -87,7 +87,7 @@ Sage accelerates attention kernel only. With FBCache skipping blocks + distilled
 
 ## What to try next if SA2.2 validates
 
-- ~~`sageattn_qk_int8_pv_fp8_cuda` FP8-PV kernel~~ — **BANNED per user rule
+- ~~`sageattn_qk_int8_pv_fp8_cuda` FP8-PV kernel~~ — **excluded by the bf16-only quality rule
   2026-06-10: no fp8 anywhere, bf16 only.** fp16-PV + fp32-accum is the ceiling.
 - SpargeAttn (thu-ml, Apache) — sparse attention on TOP of sage kernels,
   explicit FBCache-coexistence design (`skip_*blocks`), CUDA ≥12.8 Blackwell gate.
@@ -116,7 +116,7 @@ compression → ~15k tokens at this res → attention share of step time too sma
 
 State: patch deployed, default OFF (env unset). Kernel proven healthy on sm_120 —
 reusable substrate if a sparse-attention successor (SpargeAttn-class) lands sm_120
-kernels. Old memory dead-end "SA2.2 = black output on LTX" = CORRECTED (env failure,
+kernels. Earlier dead-end note "SA2.2 = black output on LTX" = CORRECTED (env failure,
 not kernel): it builds + runs clean; rejection reason is throughput, not quality.
 
 ## Quality rule (user, 2026-06-10)
