@@ -172,6 +172,13 @@ LTX_FP8 = os.environ.get("LTX_FP8", "0") == "1"
 # prompts[0] via a sampled Gemma generate). See bench/EMB_CACHE_VERIFIED.md.
 LTX_CACHE_TEXT_EMB = os.environ.get("LTX_CACHE_TEXT_EMB", "1") == "1"
 _EMB_CACHE_MAX = int(os.environ.get("LTX_CACHE_TEXT_EMB_MAX", "8"))
+# 2026-06-10: free-VRAM threshold below which an emb-cache MISS encodes via the
+# upstream STREAMING text-encoder path (OffloadMode.CPU, layer-wise blocks,
+# ~5 GB peak) instead of the full ~23 GB Gemma GPU build. A MISS on a warm
+# container with both stage transformers persisted (~70.8 GB resident) pushed
+# total to 93.75 GB and OOM'd (measured: batch clip 2, first new prompt).
+# Same weights/math/dtype → identical embeddings; only the MISS latency changes.
+_EMB_STREAM_FREE_GB = float(os.environ.get("LTX_EMB_STREAM_FREE_GB", "28"))
 _EMB_CACHE: dict = {}
 _EMB_CACHE_ORDER: list = []
 _EMB_CACHE_STATE: dict = {
@@ -380,7 +387,14 @@ def _make_tiling_config(tile_px=None, temporal_frames=None):
     """Build a VAE TilingConfig from env defaults with optional per-request
     overrides. Clamps to LTX's validity rules (spatial: >=64 & /32, overlap /32
     & < tile; temporal: >=16 & /8, overlap /8 & < tile) so a swept value can
-    never raise. Falls back to TilingConfig.default() on any import/build error."""
+    never raise. Falls back to TilingConfig.default() on any import/build error.
+
+    2026-06-10: `tile_px=0` (or env LTX_VAE_TILE_PX=0) = sentinel for NO TILING
+    → returns None → upstream pipelines run the non-tiled reference decode
+    (mathematically exact, no overlap recompute, no seam blending — faster AND
+    strictly reference-quality when the activation fits in VRAM)."""
+    if (tile_px is not None and int(tile_px) == 0) or (tile_px is None and _VAE_TILE_PX == 0):
+        return None
     try:
         from ltx_core.model.video_vae import TilingConfig
         from ltx_core.model.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig
@@ -513,6 +527,395 @@ def _purge_stale_residents(height: int, width: int, cap: int) -> None:
 _LTX_SAGE_ATTN_MODE = os.environ.get("LTX_SAGE_ATTN", "0").strip()
 LTX_SAGE_ATTN = _LTX_SAGE_ATTN_MODE == "1"   # SA3 FP4 (legacy bench toggle)
 LTX_SAGE22 = _LTX_SAGE_ATTN_MODE == "2"      # SA2.2 INT8-QK/FP16-PV (opt-in)
+# 2026-06-10: SA2.2 is now RUNTIME-toggleable. The patch installs whenever the
+# `sageattention` package is importable (built into the image since the CUDA-13
+# base bump), and this mutable flag — not the env var — decides PER CALL whether
+# self-attn routes through SA2.2 or the original SDPA path. Why: A/B benching
+# sage-vs-SDPA inside ONE warm container (same resident pipeline, same fused
+# LoRA) is the only clean comparison — persist-pipeline LoRA fusion is not
+# reproducible across containers, so cross-deploy A/B would pollute both the
+# latency and the PSNR comparison. Default = env (LTX_SAGE_ATTN=2 → on, else
+# off); `smoke_generate(sage_attn=0|1)` flips it per request.
+_SAGE22_RUNTIME = [LTX_SAGE22]
+
+# 2026-06-10 (latency fan-out): cuDNN-first SDPA priority. Pinned ltx-core
+# resolves AttentionFunction.DEFAULT → PytorchAttention → bare F.s_d_p_a, and
+# torch 2.12's builtin priority is flash > efficient > math > cudnn — cuDNN 9
+# (Blackwell-tuned, sm80–sm121) is NEVER tried. Lightricks' own newer
+# attention.py ranks sm_120 as CUDNN > FLASH > EFFICIENT > MATH, so this flag
+# adopts their policy via a torch.nn.attention.sdpa_kernel(set_priority=True)
+# context wrapped around the pipeline calls. Same-math/different-kernel: output
+# is bf16-quality, accumulation order may differ from flash (A/B gated).
+# Default = env LTX_SDPA_PRIORITY ("cudnn" → on); per-request override via
+# `smoke_generate(sdpa_cudnn=0|1)` for same-container A/B.
+_SDPA_CUDNN_RUNTIME = [os.environ.get("LTX_SDPA_PRIORITY", "").strip().lower() == "cudnn"]
+
+
+def _sdpa_priority_ctx():
+    """Context manager for the per-request SDPA backend priority.
+
+    Returns sdpa_kernel(CUDNN > FLASH > EFFICIENT > MATH, set_priority=True)
+    when the cuDNN-first toggle is on, else a nullcontext (torch default
+    priority: flash > efficient > math > cudnn). Cheap to construct per call;
+    backend choice is runtime dispatch inside the aten SDPA op, so flipping it
+    does NOT retrace torch.compile'd blocks."""
+    import contextlib
+    if not _SDPA_CUDNN_RUNTIME[0]:
+        return contextlib.nullcontext()
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        return sdpa_kernel(
+            [
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ],
+            set_priority=True,
+        )
+    except Exception as _e:  # very old torch / API drift — fail open
+        print(f"   [SDPA-PRIO] sdpa_kernel unavailable ({_e}); using torch default priority")
+        return contextlib.nullcontext()
+
+
+# 2026-06-10 (latency fan-out): NVENC video encode — SUBPROCESS variant.
+# Measured chain of evidence:
+#   1. PyAV 17.1.0 h264_nvenc opens fine in a BARE container (probe_nvenc.py,
+#      driver 580.95.05) — codec + driver + libnvidia-encode all present.
+#   2. The SAME open fails IN-PROCESS once torch has initialized CUDA:
+#      avcodec_open2("h264_nvenc") → generic UnknownError(1313558101), with
+#      ~21 GB VRAM free (fx bench 2026-06-10, nvenc_last_error). PyAV's
+#      bundled libavcodec + torch's CUDA libraries collide in one process.
+#   ⇒ Encode in a torch-free CHILD process: parent runs the SAME pinned-commit
+#      yuv420p/bt709 conversion on GPU and pipes raw planar frames over stdin;
+#      the child (PyAV only, no torch import) owns the h264_nvenc session
+#      (p6 + vbr + cq 19 + spatial/temporal AQ ≈ x264 crf19 visual parity —
+#      A/B gated before any default flip). Default = env LTX_VIDEO_ENCODER
+#      ("nvenc" → on); per-request override via `smoke_generate(nvenc=0|1)`.
+_NVENC_RUNTIME = [os.environ.get("LTX_VIDEO_ENCODER", "").strip().lower() == "nvenc"]
+
+
+def _encode_video_dispatch(**kwargs):
+    """Route to NVENC or upstream libx264 encode based on the runtime flag.
+
+    NO mid-stream fallback: the `video` arg is a one-shot lazy-decode iterator —
+    a failed NVENC attempt has already consumed chunks, so re-calling libx264
+    with it would StopIteration (matrix bench bug 2026-06-10). Instead, NVENC
+    encoder availability is probed with a tiny in-memory open BEFORE touching
+    the iterator; only a healthy encoder proceeds."""
+    from ltx_pipelines.utils.media_io import encode_video
+    if not _NVENC_RUNTIME[0]:
+        return encode_video(**kwargs)
+    try:
+        _nvenc_preflight()
+    except Exception as e:
+        print(f"   [NVENC] preflight failed ({e!r}) — using libx264 (iterator untouched)")
+        _NVENC_LAST_ERROR[0] = repr(e)  # surfaced in smoke result for diagnosis
+        return encode_video(**kwargs)
+    _NVENC_LAST_ERROR[0] = None
+    return _encode_video_nvenc(**kwargs)
+
+
+_NVENC_LAST_ERROR: list = [None]
+_NVENC_SUBPROC_OK: list = [None]  # tri-state per container: None=unprobed, True/False
+
+# Child-process encoder source. Written verbatim to $TMPDIR/_nvenc_child.py at
+# first use. MUST NOT import torch (a clean dlopen space is the whole point —
+# see the NVENC evidence-chain comment above).
+_NVENC_CHILD_SRC = r'''
+"""h264_nvenc child encoder — torch-free process, clean CUDA/libavcodec space.
+
+Modes:
+  --probe
+      Open + close a 64x64 h264_nvenc encoder in memory. Exit 0 = NVENC usable.
+  <out.mp4> <width> <height> <fps> <cq> <colorspace|none> <color_range|none>
+            <audio.npy|none> <audio_rate>
+      Read yuv420p PLANAR uint8 frames (height*3//2 rows x width cols each)
+      from stdin until EOF, encode h264_nvenc, then mux AAC audio from the
+      int16 stereo (N,2) .npy sidecar. Mirrors the pinned-commit
+      media_io.encode_video container/audio behavior (1799988).
+"""
+import sys
+
+
+def _read_exact(src, n):
+    buf = bytearray()
+    while len(buf) < n:
+        b = src.read(n - len(buf))
+        if not b:
+            break
+        buf += b
+    return bytes(buf)
+
+
+def _maybe_int(v):
+    try:
+        return int(v)
+    except ValueError:
+        return v
+
+
+def main():
+    import av
+    import numpy as np
+
+    if sys.argv[1] == "--probe":
+        import io
+        buf = io.BytesIO()
+        c = av.open(buf, mode="w", format="mp4")
+        try:
+            s = c.add_stream("h264_nvenc", rate=24, options={"preset": "p6"})
+            s.width = s.height = 64
+            s.pix_fmt = "yuv420p"
+            f = av.VideoFrame.from_ndarray(
+                np.zeros((96, 64), dtype=np.uint8), format="yuv420p"
+            )
+            for p in s.encode(f):
+                c.mux(p)
+            for p in s.encode():
+                c.mux(p)
+        finally:
+            c.close()
+        return 0
+
+    (out, w, h, fps, cq, csp, crange, audio_npy, audio_rate) = sys.argv[1:10]
+    w, h, fps = int(w), int(h), int(fps)
+    fh = h * 3 // 2          # yuv420p planar rows per frame
+    fbytes = fh * w
+
+    container = av.open(out, mode="w")
+    try:
+        stream = container.add_stream(
+            "h264_nvenc",
+            rate=fps,
+            options={
+                "preset": "p6",
+                "rc": "vbr",
+                "cq": str(cq),
+                "spatial-aq": "1",
+                "temporal-aq": "1",
+                "b": "0",
+            },
+        )
+        stream.width = w
+        stream.height = h
+        stream.pix_fmt = "yuv420p"
+        if csp != "none":
+            stream.codec_context.colorspace = _maybe_int(csp)
+        if crange != "none":
+            stream.codec_context.color_range = _maybe_int(crange)
+
+        audio_stream = None
+        if audio_npy != "none":
+            from fractions import Fraction
+            rate = int(audio_rate)
+            audio_stream = container.add_stream("aac", rate=rate)
+            audio_stream.codec_context.sample_rate = rate
+            audio_stream.codec_context.layout = "stereo"
+            audio_stream.codec_context.time_base = Fraction(1, rate)
+
+        src = sys.stdin.buffer
+        n_frames = 0
+        while True:
+            raw = _read_exact(src, fbytes)
+            if not raw:
+                break
+            if len(raw) != fbytes:
+                raise EOFError(f"short frame read: {len(raw)}/{fbytes}")
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(fh, w)
+            frame = av.VideoFrame.from_ndarray(arr, format="yuv420p")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+            n_frames += 1
+        for packet in stream.encode():
+            container.mux(packet)
+        if n_frames == 0:
+            raise RuntimeError("no frames received on stdin")
+
+        if audio_stream is not None:
+            rate = int(audio_rate)
+            samples = np.load(audio_npy)  # int16 (N, 2), parent pre-converted
+            frame_in = av.AudioFrame.from_ndarray(
+                np.ascontiguousarray(samples).reshape(1, -1),
+                format="s16",
+                layout="stereo",
+            )
+            frame_in.sample_rate = rate
+            cc = audio_stream.codec_context
+            resampler = av.audio.resampler.AudioResampler(
+                format=cc.format or "fltp",
+                layout=cc.layout or "stereo",
+                rate=cc.sample_rate or rate,
+            )
+            next_pts = 0
+            for rframe in resampler.resample(frame_in):
+                if rframe.pts is None:
+                    rframe.pts = next_pts
+                next_pts += rframe.samples
+                rframe.sample_rate = rate
+                container.mux(audio_stream.encode(rframe))
+            for packet in audio_stream.encode():
+                container.mux(packet)
+    finally:
+        container.close()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:  # noqa: BLE001 — single funnel to stderr for the parent
+        print(f"NVENC-CHILD-ERROR: {e!r}", file=sys.stderr, flush=True)
+        sys.exit(1)
+'''
+
+
+def _nvenc_child_path() -> str:
+    """Materialize the child encoder script once per container; return its path."""
+    import tempfile
+    p = os.path.join(tempfile.gettempdir(), "_nvenc_child.py")
+    if not os.path.exists(p):
+        with open(p, "w") as f:
+            f.write(_NVENC_CHILD_SRC)
+    return p
+
+
+def _nvenc_preflight():
+    """Probe NVENC in a torch-free SUBPROCESS, cached per container.
+
+    The old in-process probe is useless here: avcodec_open2("h264_nvenc")
+    fails with a generic UnknownError once torch owns CUDA in this process
+    (measured 2026-06-10 with ~21 GB VRAM free), while the identical open
+    succeeds in a clean process. Raises BEFORE the caller's one-shot video
+    iterator is consumed."""
+    if _NVENC_SUBPROC_OK[0] is True:
+        return
+    if _NVENC_SUBPROC_OK[0] is False:
+        raise RuntimeError(_NVENC_LAST_ERROR[0] or "nvenc subprocess probe failed earlier")
+    import subprocess
+    import sys as _sys
+    r = subprocess.run(
+        [_sys.executable, _nvenc_child_path(), "--probe"],
+        capture_output=True,
+        timeout=120,
+    )
+    if r.returncode != 0:
+        _NVENC_SUBPROC_OK[0] = False
+        raise RuntimeError(
+            "nvenc subprocess probe failed: "
+            + r.stderr.decode(errors="replace").strip()[:300]
+        )
+    _NVENC_SUBPROC_OK[0] = True
+
+
+def _encode_video_nvenc(
+    video,
+    fps: int,
+    audio,
+    output_path: str,
+    video_chunks_number: int,
+    crf: int = 19,
+):
+    """h264_nvenc encode via a torch-free CHILD process (_NVENC_CHILD_SRC).
+
+    Pixels are produced EXACTLY like pinned-commit `media_io.encode_video`
+    (1799988): same yuv420p/bt709 GPU converter, same chunk order. Only the
+    encoder differs — raw planar frames stream over stdin to a child that owns
+    the h264_nvenc session; the child also muxes the AAC audio with the same
+    int16→resample math as upstream `_write_audio`. The child encodes WHILE
+    the parent converts/copies the next chunk, so the pipe itself overlaps.
+    NO fallback after the first chunk is consumed (one-shot iterator) — a
+    child failure post-preflight raises loudly."""
+    import subprocess
+    import sys as _sys
+    import tempfile
+    import numpy as _np
+    import torch as _t
+    from pathlib import Path
+    from ltx_pipelines.utils.media_io import yuv420p_bt709_converter_
+
+    frame_converter = yuv420p_bt709_converter_
+    if isinstance(video, _t.Tensor):
+        video = iter([video])
+
+    def convert(chunk):
+        return frame_converter(chunk.movedim(-1, -3))
+
+    first_chunk = convert(next(video))
+    # yuv420p planar layout from the converter (same math as upstream)
+    height = first_chunk.shape[-2] * 2 // 3
+    width = first_chunk.shape[-1]
+
+    csp = (
+        str(frame_converter.color_space.av_colorspace)
+        if frame_converter.color_space is not None
+        else "none"
+    )
+    crange = (
+        str(frame_converter.color_range.av_color_range)
+        if frame_converter.color_range is not None
+        else "none"
+    )
+
+    # Audio sidecar: identical int16-stereo conversion to upstream _write_audio.
+    audio_npy = "none"
+    audio_rate = "0"
+    tmp_audio_path = None
+    if audio is not None:
+        samples = audio.waveform
+        if samples.ndim == 1:
+            samples = samples[:, None]
+        if samples.shape[1] != 2 and samples.shape[0] == 2:
+            samples = samples.T
+        if samples.shape[1] != 2:
+            raise ValueError(f"Expected samples with 2 channels; got shape {tuple(samples.shape)}.")
+        if samples.dtype != _t.int16:
+            samples = _t.clip(samples, -1.0, 1.0)
+            samples = (samples * 32767.0).to(_t.int16)
+        tf = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
+        _np.save(tf, samples.contiguous().cpu().numpy())
+        tf.close()
+        tmp_audio_path = tf.name
+        audio_npy = tmp_audio_path
+        audio_rate = str(int(audio.sampling_rate))
+
+    cmd = [
+        _sys.executable, _nvenc_child_path(), output_path,
+        str(width), str(height), str(int(fps)), str(crf),
+        csp, crange, audio_npy, audio_rate,
+    ]
+    stderr_f = tempfile.TemporaryFile()
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=stderr_f)
+    success = False
+    try:
+        try:
+            proc.stdin.write(first_chunk.to("cpu").numpy().tobytes())
+            for chunk in video:
+                proc.stdin.write(convert(chunk).to("cpu").numpy().tobytes())
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass  # child died mid-feed; rc/stderr below carry the real error
+        rc = proc.wait()
+        if rc != 0:
+            stderr_f.seek(0)
+            err = stderr_f.read().decode(errors="replace").strip()
+            raise RuntimeError(f"nvenc child exited {rc}: {err[:500]}")
+        success = True
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        stderr_f.close()
+        if tmp_audio_path is not None:
+            try:
+                os.unlink(tmp_audio_path)
+            except OSError:
+                pass
+        if not success:
+            Path(output_path).unlink(missing_ok=True)
+    print(f"   [NVENC] video saved to {output_path} (subprocess h264_nvenc)")
+
 
 LTX_FP8_REPO = "Lightricks/LTX-2.3-fp8"
 LTX_FP8_REVISION = "1d756cd27fa11c0896c4dfee093cd1bf36c7f7a1"
@@ -881,7 +1284,14 @@ def download_models():
 # =============================================================================
 
 ltx2_image = (
-    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.12")
+    # 2026-06-10: base bumped 12.4.0 → 13.0.3-devel so the container nvcc (13.0)
+    # matches the CUDA torch was compiled against (torch 2.12.0+cu130 via
+    # ltx-core). This unblocks building CUDA extensions in-image — specifically
+    # sageattention 2.2 (the SA2.2 build step below). Runtime behavior is
+    # unchanged: torch ships its own CUDA runtime libs; the base toolkit only
+    # matters at build time. (12.4 base = the old "can't build flash-attn/sage"
+    # wall documented in W7 + the SAGE notes above.)
+    modal.Image.from_registry("nvidia/cuda:13.0.3-devel-ubuntu22.04", add_python="3.12")
     .apt_install(
         "git", "cmake", "build-essential", "clang",
         "libgl1-mesa-glx", "libglib2.0-0", "libopengl0", "libglx0",
@@ -997,6 +1407,37 @@ ltx2_image = (
     .run_function(
         download_models,
         volumes=volumes,
+    )
+    # 2026-06-10: SageAttention 2.2 source build (INT8-QK + FP16-PV CUDA kernels,
+    # sm_120). Activates the previously-inert LTX_SAGE_ATTN=2 branch in _gpu_init.
+    # Build choices (researched 2026-06-10, see SAGEATTENTION_SM120.md):
+    #   * SOURCE build from thu-ml/SageAttention main — NOT `pip install
+    #     sageattention` (PyPI ships 1.0.6 = documented BLACK-OUTPUT on Blackwell,
+    #     ComfyUI discussion #11583) and NOT a prebuilt wheel (no linux torch-2.12
+    #     cu130 wheel exists anywhere as of 2026-06-10).
+    #   * TORCH_CUDA_ARCH_LIST="12.0" ONLY — including 9.0 breaks the build with
+    #     sm_90a `wgmma.*` PTX instructions illegal on sm_120 (thu-ml issue #291).
+    #   * --no-build-isolation so it compiles against the already-installed
+    #     torch 2.12.0+cu130 (nvcc 13.0 base above matches its compiled CUDA).
+    #   * Placed AFTER download_models so sage tweaks never re-trigger the
+    #     model-download layer. gpu="any" so torch's CUDA probing at setup time
+    #     has a device (arch list is still forced explicitly).
+    .run_commands(
+        # wheel needed: --no-build-isolation uses image setuptools, whose
+        # bdist_wheel command lives in the `wheel` package (else
+        # "error: invalid command 'bdist_wheel'").
+        "pip install ninja wheel packaging",
+        "git clone --depth 1 https://github.com/thu-ml/SageAttention.git /tmp/SageAttention"
+        " && cd /tmp/SageAttention && echo SAGE_COMMIT=$(git rev-parse HEAD)",
+        "cd /tmp/SageAttention && EXT_PARALLEL=4 NVCC_APPEND_FLAGS='--threads 4' MAX_JOBS=6"
+        " TORCH_CUDA_ARCH_LIST='12.0' pip install --no-build-isolation -v .",
+        # Fail the BUILD (not first request) if the import or the CUDA extension
+        # is broken; prints the compiled extension list for the build log.
+        "python -c \"import sageattention, os; d=os.path.dirname(sageattention.__file__);"
+        " ext=[f for f in os.listdir(d) if f.endswith('.so')];"
+        " print('sageattention OK at', d); print('extensions:', ext);"
+        " from sageattention import sageattn_qk_int8_pv_fp16_cuda; print('fp16_cuda kernel import OK')\"",
+        gpu="any",
     )
     # Ship the utils/ package (CPU-pinned + GPU-resident weight registries,
     # First-Block-Cache, custom guiders). Modal only auto-mounts the entry
@@ -1340,7 +1781,39 @@ class Model:
                     if miss_prompts:
                         sub_kw = dict(kw)
                         sub_kw["enhance_first_prompt"] = enhance and (0 in miss_idx) and (miss_idx[0] == 0)
-                        sub_out = _orig_pe_call_ec(self_pe, miss_prompts, **sub_kw)
+                        # VRAM guard (2026-06-10): upstream PromptEncoder builds the
+                        # FULL ~23 GB Gemma on GPU inside __call__ and frees on exit.
+                        # With both stage transformers persisted (~70.8 GB) that
+                        # collides with the 95 GB card — measured OOM at 93.75 GB on
+                        # the first new-prompt MISS of a warm container (batch clip 2).
+                        # When free VRAM is tight, flip THIS call to the upstream
+                        # streaming path (OffloadMode.CPU: layer-wise blocks, ~5 GB
+                        # peak, same weights/math → identical embeddings), restore
+                        # after. Fresh containers keep the fast full-GPU build.
+                        # Skipped under enhance (generate() path untested streaming).
+                        _flip_om = False
+                        _om_prev = getattr(self_pe, "_offload_mode", None)
+                        try:
+                            if (
+                                not sub_kw["enhance_first_prompt"]
+                                and _om_prev is not None
+                                and getattr(self_pe, "_streaming_text_encoder_builder", None) is not None
+                                and _free_vram_gb() < _EMB_STREAM_FREE_GB
+                            ):
+                                from ltx_pipelines.utils.types import OffloadMode as _OM
+                                if _om_prev == _OM.NONE:
+                                    self_pe._offload_mode = _OM.CPU
+                                    _flip_om = True
+                                    print(f"   [EMB-CACHE] MISS under low VRAM "
+                                          f"({_free_vram_gb():.1f}GB free < {_EMB_STREAM_FREE_GB:.0f}GB) "
+                                          f"→ streaming Gemma (OffloadMode.CPU)")
+                        except Exception as _e_om:
+                            print(f"   ⚠️ emb streaming flip skipped (non-fatal): {_e_om}")
+                        try:
+                            sub_out = _orig_pe_call_ec(self_pe, miss_prompts, **sub_kw)
+                        finally:
+                            if _flip_om:
+                                self_pe._offload_mode = _om_prev
                         for j, i in enumerate(miss_idx):
                             out = sub_out[j]
                             results[i] = out
@@ -1592,6 +2065,14 @@ class Model:
         torch.backends.cuda.enable_mem_efficient_sdp(True)
         torch.backends.cuda.enable_math_sdp(True)
 
+        # 2026-06-10 (latency fan-out): cuDNN conv-algo autotune for the
+        # conv-heavy VAE decode. Shapes are fixed per resolution (tiling or
+        # not), so the one-time per-shape probe amortizes immediately. Same
+        # bf16 conv math — algorithm choice only. Kill-switch: LTX_CUDNN_BENCH=0.
+        if os.environ.get("LTX_CUDNN_BENCH", "1").strip() != "0":
+            torch.backends.cudnn.benchmark = True
+            print("   ⚡ cudnn.benchmark=True (VAE conv autotune; LTX_CUDNN_BENCH=0 to disable)")
+
         # --- GPU-RESIDENT registry MUST be (re)built post-snapshot (2026-06-06) ---
         # `_snap_init` runs on a CPU-only snapshot sandbox: a GPU-resident
         # registry can't allocate CUDA tensors there, and the cached snapshot may
@@ -1757,14 +2238,16 @@ class Model:
         # is_causal=False)`) and a per-call try/except → SDPA fallback (mask
         # preserved) so a single bad kernel call can never crash a request.
         #
-        # NOTE: this branch is INERT on the prod image until two things change:
-        #   (a) prod env `LTX_SAGE_ATTN` is flipped to "2", AND
-        #   (b) the prod image is rebuilt on a CUDA-13 base with
-        #       `sageattention==2.2.0` installed (the 12.4 base cannot build it).
-        # With neither done, `from sageattention import ...` raises ImportError
-        # here and we log + fall back to bf16-SDPA. The bench app
-        # `ltx2-sage22-bench` is where SA2.2 is actually exercised + measured.
-        elif LTX_SAGE22:
+        # 2026-06-10 UPDATE: no longer env-gated at install time. The image now
+        # builds sageattention from source (CUDA-13 base + the SA2.2 build step
+        # in the Image definition), so the patch installs whenever the package
+        # imports — but whether a given request actually USES it is decided per
+        # call by `_SAGE22_RUNTIME[0]` (default = env LTX_SAGE_ATTN=2, flip per
+        # request via `smoke_generate(sage_attn=...)`). When the flag is off the
+        # mirror delegates verbatim to the original forward → bf16-SDPA,
+        # preserving default prod behavior. On an old cached image without
+        # sageattention, the ImportError below logs + falls back to SDPA.
+        elif _LTX_SAGE_ATTN_MODE != "1":
             try:
                 from sageattention import sageattn_qk_int8_pv_fp16_cuda as _sage22
                 import ltx_core.model.transformer.attention as _ltx_attn3
@@ -1776,7 +2259,9 @@ class Model:
                     self, x, context=None, mask=None, pe=None, k_pe=None,
                     perturbation_mask=None, all_perturbed=False,
                 ):
-                    is_self_attn = (context is None and mask is None and not all_perturbed)
+                    # Runtime flag first: when off, delegate verbatim → SDPA.
+                    is_self_attn = (_SAGE22_RUNTIME[0] and context is None
+                                    and mask is None and not all_perturbed)
                     if not is_self_attn:
                         return _orig_attn_forward22(
                             self, x, context=context, mask=mask, pe=pe, k_pe=k_pe,
@@ -1825,16 +2310,20 @@ class Model:
 
                 _ltx_attn3.Attention.forward = _sage22_attn_forward
                 self._sage_attn_active = True
-                print("   ⚡ SageAttention-2.2 ENABLED (LTX_SAGE_ATTN=2): self-attn → "
-                      "sageattn_qk_int8_pv_fp16_cuda (HND), cross-attn → SDPA (mask-safe)")
+                print(f"   ⚡ SageAttention-2.2 patch INSTALLED (runtime default: "
+                      f"{'ON' if _SAGE22_RUNTIME[0] else 'OFF'}, env LTX_SAGE_ATTN="
+                      f"{_LTX_SAGE_ATTN_MODE!r}): self-attn → "
+                      "sageattn_qk_int8_pv_fp16_cuda (HND, pv_accum=fp32), "
+                      "cross-attn → SDPA (mask-safe), per-request toggle via "
+                      "smoke_generate(sage_attn=0|1)")
             except Exception as e:
-                print(f"   ⚠️ SageAttention-2.2 patch FAILED — falling back to SDPA: "
+                print(f"   ⚠️ SageAttention-2.2 patch unavailable — bf16-SDPA default: "
                       f"{type(e).__name__}: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            print(f"   ⏭️  SageAttention disabled (LTX_SAGE_ATTN={_LTX_SAGE_ATTN_MODE!r}): "
-                  "bf16-SDPA default")
+                if not isinstance(e, ImportError):
+                    # ImportError = old image without sage (benign). Anything
+                    # else is a real patch bug — keep the traceback.
+                    import traceback
+                    traceback.print_exc()
 
         # --- 5. FBCache hooks (W5) — constructed here because their stored
         # `prev_residual` tensors live on GPU. ---
@@ -2543,10 +3032,13 @@ class Model:
         print(f"   Resolution: {width}x{height}, Frames: {num_frames}, FPS: {frame_rate}")
 
         tiling_config = _make_tiling_config()
-        video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
+        video_chunks_number = (
+            get_video_chunks_number(num_frames, tiling_config)
+            if tiling_config is not None else 1
+        )
 
         inference_start = time.time()
-        with torch.inference_mode():
+        with torch.inference_mode(), _sdpa_priority_ctx():
             video, audio = pipeline(
                 prompt=prompt,
                 seed=seed,
@@ -2566,7 +3058,7 @@ class Model:
         encode_start = time.time()
         output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
         with torch.no_grad():
-            encode_video(
+            _encode_video_dispatch(
                 video=video,
                 fps=int(frame_rate),
                 audio=audio,
@@ -3181,12 +3673,17 @@ class Model:
         inference_start = time.time()
 
         tiling_config = _make_tiling_config(tile_px, temporal_frames)
-        _sp = tiling_config.spatial_config
-        _tp = tiling_config.temporal_config
-        print(f"   [VAE-TILE] spatial={getattr(_sp,'tile_size_in_pixels',None)}/{getattr(_sp,'tile_overlap_in_pixels',None)} "
-              f"temporal={getattr(_tp,'tile_size_in_frames',None)}/{getattr(_tp,'tile_overlap_in_frames',None)} "
-              f"lru_max={_PERSIST_STATE['lru_max']}")
-        video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
+        if tiling_config is None:
+            print(f"   [VAE-TILE] DISABLED (tile_px=0) — non-tiled reference decode; "
+                  f"lru_max={_PERSIST_STATE['lru_max']}")
+            video_chunks_number = 1
+        else:
+            _sp = tiling_config.spatial_config
+            _tp = tiling_config.temporal_config
+            print(f"   [VAE-TILE] spatial={getattr(_sp,'tile_size_in_pixels',None)}/{getattr(_sp,'tile_overlap_in_pixels',None)} "
+                  f"temporal={getattr(_tp,'tile_size_in_frames',None)}/{getattr(_tp,'tile_overlap_in_frames',None)} "
+                  f"lru_max={_PERSIST_STATE['lru_max']}")
+            video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
 
         # HQ pipeline uses LTX_2_3_HQ_PARAMS (stg_scale=0, rescale=0.45);
         # the Euler path uses LTX_2_3_PARAMS via detect_params. The user
@@ -3198,7 +3695,7 @@ class Model:
                 print("   ⚠️  mode='preview' ignores negative_prompt (DistilledPipeline has no CFG branch)")
             if num_inference_steps != 30:
                 print(f"   ⚠️  mode='preview' ignores num_inference_steps={num_inference_steps} (fixed by DISTILLED_SIGMAS = ~11 total ops)")
-            with torch.inference_mode():
+            with torch.inference_mode(), _sdpa_priority_ctx():
                 video, audio = pipeline(
                     prompt=prompt,
                     seed=seed,
@@ -3274,7 +3771,7 @@ class Model:
                     f"(apg_eta={apg_eta}, apg_norm_threshold={apg_norm_threshold})"
                 )
 
-            with torch.inference_mode():
+            with torch.inference_mode(), _sdpa_priority_ctx():
                 video, audio = pipeline(
                     prompt=prompt,
                     negative_prompt=negative_prompt,
@@ -3291,7 +3788,8 @@ class Model:
                     enhance_prompt=enhance_prompt,
                 )
 
-        print(f"   Inference completed in {time.time() - inference_start:.1f}s")
+        inference_s = round(time.time() - inference_start, 2)
+        print(f"   Inference completed in {inference_s:.1f}s")
 
         if active_fbcache is not None:
             print(f"   {active_fbcache.stats_str()}")
@@ -3305,7 +3803,7 @@ class Model:
 
         # Use torch.no_grad() to avoid inference mode issues with VAE decoder
         with torch.no_grad():
-            encode_video(
+            _encode_video_dispatch(
                 video=video,
                 fps=int(frame_rate),
                 audio=audio,
@@ -3313,7 +3811,19 @@ class Model:
                 video_chunks_number=video_chunks_number,
             )
 
-        print(f"   Encoding completed in {time.time() - encode_start:.1f}s")
+        encode_s = round(time.time() - encode_start, 2)
+        print(f"   Encoding completed in {encode_s:.1f}s")
+        # 2026-06-10: phase attribution for the latency fan-out — NOTE the
+        # "inference" phase INCLUDES the chunked VAE decode that encode_video
+        # pulls through the `video` iterator only when video is a materialized
+        # tensor; with the streaming iterator (default), decode cost lands in
+        # encode_s. Either way inference_s + encode_s ≈ request compute time.
+        self._last_phases = {
+            "inference_s": inference_s,
+            "encode_s": encode_s,
+            "vae_tiling": "off" if tiling_config is None else "on",
+            "sdpa_cudnn": bool(_SDPA_CUDNN_RUNTIME[0]),
+        }
 
         # Read video bytes
         with open(output_path, "rb") as f:
@@ -3546,6 +4056,9 @@ class Model:
         tile_px: int | None = None,
         temporal_frames: int | None = None,
         force_lru_max: int | None = None,
+        sage_attn: int | None = None,
+        sdpa_cudnn: int | None = None,
+        nvenc: int | None = None,
     ) -> dict:
         """Auth-free smoke entrypoint for reorg + optimization-stack verification.
 
@@ -3560,6 +4073,21 @@ class Model:
         import time as _time
         import torch as _t_sm
         from PIL import Image as _Image
+
+        # 2026-06-10: per-request SageAttention-2.2 toggle (A/B benching inside
+        # one warm container). None = leave current state; 0 = force SDPA;
+        # 1 (or 2) = route self-attn through SA2.2 for this and following
+        # requests until flipped again.
+        if sage_attn is not None:
+            _SAGE22_RUNTIME[0] = bool(sage_attn)
+        # 2026-06-10: per-request cuDNN-first SDPA priority toggle (same
+        # same-container A/B rationale as sage_attn). None = leave current.
+        if sdpa_cudnn is not None:
+            _SDPA_CUDNN_RUNTIME[0] = bool(sdpa_cudnn)
+        # 2026-06-10: per-request NVENC encode toggle (probe-verified PyAV
+        # h264_nvenc on this image; falls back to libx264 on any failure).
+        if nvenc is not None:
+            _NVENC_RUNTIME[0] = bool(nvenc)
 
         smoke_img_path = "/tmp/_ltx2_smoke.png"
         import base64 as _b64_sm
@@ -3680,11 +4208,212 @@ class Model:
             "persist_evictions": _PERSIST_STATE["evictions"] - _ev0,
             "persist_resident_count": len(_PERSIST_TRANSFORMERS),
             "persist_oom_fallback": _PERSIST_STATE["oom_fallback"],
+            # SA2.2 state for this request: was the runtime flag on, and is the
+            # patch actually installed in this container (sage importable)?
+            "sage_attn_active": bool(_SAGE22_RUNTIME[0]),
+            "sage_patch_installed": bool(getattr(self, "_sage_attn_active", False)),
+            # 2026-06-10 latency fan-out toggles + phase attribution
+            "sdpa_cudnn_active": bool(_SDPA_CUDNN_RUNTIME[0]),
+            # engagement, not just the flag: False whenever preflight fell back
+            "nvenc_active": bool(_NVENC_RUNTIME[0]) and _NVENC_LAST_ERROR[0] is None,
+            "nvenc_last_error": _NVENC_LAST_ERROR[0],
+            "phases": getattr(self, "_last_phases", None),
             # Optional raw mp4 (base64) for the bit-identical RGB comparison. Only
             # set when explicitly requested (keeps the default smoke payload tiny).
             "video_b64": (
                 __import__("base64").b64encode(video_bytes).decode("ascii")
                 if (return_video_b64 and video_bytes) else None
+            ),
+        }
+
+    @modal.method()
+    def smoke_generate_batch(
+        self,
+        prompts: list[str],
+        height: int = 1280,
+        width: int = 768,
+        num_frames: int = 121,
+        num_inference_steps: int = 8,
+        seed: int = 42,
+        overlap: bool = True,
+        return_video_b64: bool = False,
+        tile_px: int | None = None,
+        nvenc: int | None = None,
+        sdpa_cudnn: int | None = None,
+    ) -> dict:
+        """Batched default-mode i2v with denoise/finalize OVERLAP (2026-06-10).
+
+        PipeDiT-concept, single GPU: while clip i+1 denoises on the default
+        CUDA stream, clip i's finalize (lazy chunked VAE decode pulled by the
+        encoder + mp4 mux) runs on a worker thread under a side CUDA stream.
+        Output is bit-identical to the serial path (same kernels, independent
+        tensors — scheduling only). `overlap=False` runs the exact same code
+        serially = the A/B baseline. At most ONE finalize in flight (VRAM
+        guard: decode peak rides on top of the next clip's denoise peak).
+
+        Self-contained mirror of `_process_video`'s default-mode branch
+        (i2v, cfg=3.0, neg="", 24 fps) — kept separate so the per-request
+        smoke path stays untouched.
+        """
+        import time as _time
+        import tempfile as _tempfile
+        from concurrent.futures import ThreadPoolExecutor
+        from dataclasses import replace as dc_replace
+
+        import torch
+        from PIL import Image as _Image
+        from ltx_core.model.video_vae import get_video_chunks_number
+        from ltx_pipelines.utils.args import ImageConditioningInput
+        from ltx_pipelines.utils.constants import detect_params
+
+        if nvenc is not None:
+            _NVENC_RUNTIME[0] = bool(nvenc)
+        if sdpa_cudnn is not None:
+            _SDPA_CUDNN_RUNTIME[0] = bool(sdpa_cudnn)
+        _SAGE22_RUNTIME[0] = False  # rejected 2026-06-10; batch never uses it
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+
+        t0 = _time.time()
+        img_path = "/tmp/_ltx2_smoke_batch.png"
+        _Image.new("RGB", (width, height), (24, 28, 44)).save(img_path)
+        images = [ImageConditioningInput(path=img_path, frame_idx=0, strength=1.0)]
+
+        pipeline = self._get_i2v_pipeline()
+        params = detect_params(self.checkpoint_path)
+        video_guider = dc_replace(
+            params.video_guider_params, cfg_scale=3.0, modality_scale=1.0
+        )
+        audio_guider = dc_replace(params.audio_guider_params, modality_scale=1.0)
+        # FBCache hooks off (mirror _process_video's defensive default)
+        self._fbcache_i2v_stage1.enabled = False
+        self._fbcache_kf_stage1.enabled = False
+
+        tiling_config = _make_tiling_config(tile_px, None)
+        chunks = (
+            get_video_chunks_number(num_frames, tiling_config)
+            if tiling_config is not None else 1
+        )
+
+        def _finalize(idx: int, video, audio) -> dict:
+            """Worker-thread finalize: chunked VAE decode (lazy, pulled by the
+            encoder) + mp4 mux. DEFAULT stream on purpose (2026-06-10 v2):
+            cross-stream allocator pools don't share, so a side stream would
+            fragment VRAM. (NOTE: the 93.7 GB clip-2 OOM originally blamed on
+            this was actually the ~23 GB Gemma FULL-GPU build on the first
+            new-prompt EMB-CACHE MISS of a warm container — fixed at the
+            wrapper with the OffloadMode.CPU streaming flip, see
+            _EMB_STREAM_FREE_GB.) Default stream = decode kernels
+            FIFO-interleave with the next clip's denoise; the overlap win that
+            remains is the CPU encode (~2.7 s/clip) + mux + IO, which is the
+            bulk of finalize anyway. torch.no_grad (NOT inference_mode —
+            known VAE-decoder issue, see _process_video)."""
+            e0 = _time.time()
+            out_path = _tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+            with torch.no_grad():
+                _encode_video_dispatch(
+                    video=video,
+                    fps=24,
+                    audio=audio,
+                    output_path=out_path,
+                    video_chunks_number=chunks,
+                )
+            with open(out_path, "rb") as f:
+                vb = f.read()
+            try:
+                os.unlink(out_path)
+            except Exception:
+                pass
+            return {"idx": idx, "bytes": vb, "finalize_s": round(_time.time() - e0, 2)}
+
+        clips: list[dict | None] = [None] * len(prompts)
+        denoise_times: list[float] = []
+        pending = None
+        err = None
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                for i, p in enumerate(prompts):
+                    d0 = _time.time()
+                    with torch.inference_mode(), _sdpa_priority_ctx():
+                        video, audio = pipeline(
+                            prompt=p,
+                            negative_prompt="",
+                            seed=seed + i,
+                            height=height,
+                            width=width,
+                            num_frames=num_frames,
+                            frame_rate=24.0,
+                            num_inference_steps=num_inference_steps,
+                            video_guider_params=video_guider,
+                            audio_guider_params=audio_guider,
+                            images=images,
+                            tiling_config=tiling_config,
+                            enhance_prompt=False,
+                        )
+                    denoise_times.append(round(_time.time() - d0, 2))
+                    if overlap:
+                        if pending is not None:
+                            r = pending.result()  # ≤1 finalize in flight
+                            clips[r["idx"]] = r
+                            # Inter-clip allocator hygiene (matrix-bench OOM fix
+                            # 2026-06-10): the normal path runs
+                            # _cleanup_gpu_memory() between requests; without
+                            # an equivalent here allocations crept to 93.7 GB
+                            # by clip 2. Safe: previous finalize is DONE.
+                            import gc as _gc
+                            _gc.collect()
+                            torch.cuda.empty_cache()
+                        pending = pool.submit(_finalize, i, video, audio)
+                    else:
+                        r = _finalize(i, video, audio)
+                        clips[r["idx"]] = r
+                        import gc as _gc
+                        _gc.collect()
+                        torch.cuda.empty_cache()
+                    # Drop our refs promptly — `pending` (overlap) or `r`
+                    # (serial) own what's still needed.
+                    video = audio = None
+                if pending is not None:
+                    r = pending.result()
+                    clips[r["idx"]] = r
+            torch.cuda.synchronize()
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:400]}"
+        finally:
+            self._log_gpu_memory("post-batch")
+            self._cleanup_gpu_memory()
+
+        wall = round(_time.time() - t0, 2)
+        fin = [c["finalize_s"] for c in clips if c]
+        serial_est = round(sum(denoise_times) + sum(fin), 2)
+        peak = -1.0
+        if torch.cuda.is_available():
+            try:
+                peak = round(torch.cuda.max_memory_allocated() / (1 << 30), 2)
+            except Exception:
+                pass
+        return {
+            "status": "ok" if err is None and all(clips) else "ERROR",
+            "error": err,
+            "n_clips": len(prompts),
+            "overlap": overlap,
+            "wall_s": wall,
+            "serial_estimate_s": serial_est,
+            "overlap_saved_s": round(serial_est - wall, 2),
+            "denoise_s": denoise_times,
+            "finalize_s": fin,
+            "clip_bytes": [len(c["bytes"]) if c else 0 for c in clips],
+            "peak_vram_gb": peak,
+            # engagement, not just the flag: False whenever preflight fell back
+            "nvenc_active": bool(_NVENC_RUNTIME[0]) and _NVENC_LAST_ERROR[0] is None,
+            "vae_tiling": "off" if tiling_config is None else "on",
+            "video_b64": (
+                __import__("base64").b64encode(clips[-1]["bytes"]).decode("ascii")
+                if (return_video_b64 and clips and clips[-1]) else None
             ),
         }
 
@@ -3755,12 +4484,15 @@ class Model:
         audio_guider = params.audio_guider_params
 
         tiling_config = _make_tiling_config()
-        video_chunks_number = get_video_chunks_number(src.frames, tiling_config)
+        video_chunks_number = (
+            get_video_chunks_number(src.frames, tiling_config)
+            if tiling_config is not None else 1
+        )
 
         print(f"\n🧠 Running retake inference...")
         inference_start = time.time()
 
-        with torch.inference_mode():
+        with torch.inference_mode(), _sdpa_priority_ctx():
             video_iter, audio = pipeline(
                 video_path=video_path,
                 prompt=prompt,
@@ -3784,7 +4516,7 @@ class Model:
         output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
 
         with torch.no_grad():
-            encode_video(
+            _encode_video_dispatch(
                 video=video_iter,
                 fps=int(src.fps),
                 audio=audio,

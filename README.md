@@ -94,10 +94,14 @@ Runs on **[Modal](https://modal.com)** serverless **NVIDIA RTX PRO 6000** (Black
 
 | Mode @ 768×1280 (9:16) | Warm latency | ~ $/clip |
 |---|---|---|
-| image / text / keyframe — 4 s (97 f) | **~31 s** | **~2.6¢** |
-| image / text / keyframe — 10 s (241 f) | **~80 s** | ~6.7¢ |
+| image / text / keyframe — 5 s (121 f) | **~23 s** | **~1.9¢** |
+| image / text / keyframe — 10 s (241 f) | **~45 s** | ~3.8¢ |
+| landscape 1280×768 — 5 s / 10 s | ~24 s / ~47 s | ~2.0¢ / ~4.0¢ |
+| 3-clip batch with decode/encode overlap | **~25 s/clip** (−20% vs serial) | ~2.1¢ |
 | IC-LoRA control — 4 s | **~28 s** | ~2.4¢ |
 | video-to-video (retake) — 10 s | ~470 s | ~40¢ |
+
+(5 s/10 s rows re-measured 2026-06-10, bench config with the first-block cache off — the production path with it on is faster still. First call at a NEW frame count pays a one-time shape compile, e.g. ~86 s at 241 f, then steady.)
 
 Cold start (first clip on a fresh container) ~90–200 s; idle scales to **$0**. Both 22B stage transformers stay resident — peak **~75 GB / 96 GB**, verified zero OOM over a 10-generation run (<1 GB drift).
 
@@ -105,7 +109,7 @@ Cold start (first clip on a fresh container) ~90–200 s; idle scales to **$0**.
 
 - Resident pre-fused pipeline + **activation-aware resident cap** + **cross-resolution purge** → no per-clip rebuild and no OOM when switching mode/resolution.
 - First-block feature cache (~17%), CPU-pinned weight cache, text-embedding cache, torch.compile (persisted Inductor cache), tunable VAE-decode tiling.
-- **fp8 / SageAttention / flash-attn all tested and rejected** — quality regressions or no sm_120 kernel. Speed comes from architecture, not from cheapening the math.
+- **fp8 / SageAttention / flash-attn all tested and rejected** — fp8: quality rule; flash-attn: no sm_120 kernel; SageAttention 2.2: builds + runs on sm_120 but measured +5% slower here (compile graph breaks — see Research findings). Speed comes from architecture, not from cheapening the math.
 
 ### Costs — and what that buys you
 
@@ -121,10 +125,10 @@ LTX-2.3 is a 22B video diffusion transformer. Serving it naively has two costs: 
 2. **Both stages stay resident — safely.** Two ~35 GB stage transformers + the (tiled) forward working set peak ~75 GB / 96 GB, so both stay GPU-resident at every supported resolution (measured; zero OOM over a 10-gen run, <1 GB drift). An **activation-aware cap** + a **cross-resolution purge** (drop residents from a prior, different-resolution request before the next forward) keep it safe — back-to-back mode/resolution switching never OOMs. (The earlier 94 GB OOMs were that cross-resolution accumulation, not the resident footprint.)
 3. **CPU-pinned weight cache** — weights pinned in host RAM, streamed to GPU, skipping disk reads. Bit-identical.
 4. **First-Block-Cache** — skips recomputing early transformer blocks (~17%, near-lossless).
-5. **Embedding cache** — the text encoder isn't re-run for a repeated prompt.
-6. **Batching** — 32 clips in one warm container ≈ 6.2× throughput.
+5. **Embedding cache + streaming text-encoder guard** — the text encoder isn't re-run for a repeated prompt. On a cache miss with both stages resident there isn't room for the full ~23 GB Gemma build (measured 93.7 GB → OOM), so the miss automatically switches to the upstream layer-streaming build (~5 GB peak, identical embeddings, ~+10 s once per prompt per container).
+6. **Batching + decode/encode overlap** — 32 clips in one warm container ≈ 6.2× throughput; finalize (VAE decode + mp4 mux) of clip N overlaps the denoise of clip N+1 on a worker thread → **−20% wall** measured on a 3-clip batch (92.5 s → 73.7 s).
 7. **torch.compile + persisted Inductor cache** — compiled once on the first cold container, restored from the volume on later cold starts (`max-autotune` tested + rejected, slower here).
-8. **Blackwell-native attention** — flash-attn has no sm_120 kernel yet, so this runs PyTorch SDPA (exact). fp8/SageAttention tested + rejected (noise / black frames). Speed comes from architecture, not from cheapening the math.
+8. **Blackwell-native attention** — flash-attn has no sm_120 kernel yet, so this runs PyTorch SDPA (exact). fp8 rejected (quality rule); SageAttention 2.2 builds + runs cleanly on sm_120 but measured **+5% slower** here (~770 torch.compile graph breaks per request — the kernel can't be traced). Speed comes from architecture, not from cheapening the math.
 
 Helper modules live in `utils/` and are mounted into the container.
 
@@ -143,10 +147,37 @@ Helper modules live in `utils/` and are mounted into the container.
 | `LTX_CACHE_TEXT_EMB` | `1` | LRU cache on the text encoder output. |
 | `LTX_SKIP_AUDIO` | `0` | Per-request default for skipping audio decode (video pixels byte-identical). |
 | `LTX_FP8` | `0` | Load official fp8 weights instead of bf16 (off = bf16 quality default). |
-| `LTX_VAE_TILE_PX` | `768` | VAE-decode spatial tile size (px, ≥64 & ÷32). Smaller → smaller decode peak (measured ~1 GB lever; decode is already well-tiled). Overlap blends seams. |
+| `LTX_VAE_TILE_PX` | `768` | VAE-decode spatial tile size (px, ≥64 & ÷32). Smaller → smaller decode peak (measured ~1 GB lever; decode is already well-tiled). Overlap blends seams. **`0` disables tiling entirely** → reference-exact non-tiled decode (PSNR 50–51 dB vs tiled — the delta is the tiled arm's seam blending), latency-neutral, +2.6 GB peak; fits even at 241 f (82.3 GB peak, no OOM). |
 | `LTX_VAE_TILE_OVERLAP` | `64` | Spatial tile overlap (px, ÷32, < tile). |
 | `LTX_VAE_TEMPORAL_FRAMES` | `80` | VAE-decode temporal chunk (frames, ≥16 & ÷8). |
 | `LTX_VAE_TEMPORAL_OVERLAP` | `24` | Temporal chunk overlap (frames, ÷8, < chunk). |
+| `LTX_EMB_STREAM_FREE_GB` | `28` | Free-VRAM threshold below which a text-embedding cache MISS builds Gemma via the upstream layer-streaming path (~5 GB peak) instead of the full ~23 GB GPU build. Prevents the warm-container new-prompt OOM; identical embeddings. |
+| `LTX_SDPA_PRIORITY` | unset | `cudnn` prefers the cuDNN SDPA backend **at trace time** (inductor captures the backend when compiling — runtime flips are no-ops). Measured 0% here; flag kept for other shapes/stacks. |
+| `LTX_CUDNN_BENCH` | `1` | `torch.backends.cudnn.benchmark` autotuning. `0` disables. |
+| `LTX_VIDEO_ENCODER` | unset | `nvenc` opts into h264_nvenc via a torch-free subprocess. **Known-dead under `enable_memory_snapshot=True`** (checkpoint-restored containers can't open NVENC sessions — fails loudly back to libx264, root error surfaced in `nvenc_last_error`). Works only if you disable snapshots; not worth the cold-start trade here. |
+
+---
+
+## Research findings (latency fan-out, June 2026)
+
+A systematic hunt for lossless latency wins on this stack — every lever measured A/B on the same warm container, gated on zero visual loss (blackdetect + PSNR/SSIM + frame inspection + audio). Full write-ups in [`references/`](references/):
+
+| Lever | Verdict | Evidence |
+|---|---|---|
+| Batch decode/encode overlap | ✅ **shipped, −20.4% batch wall** | 3 clips: 92.5 s → 73.7 s, peak 76 GB |
+| Streaming-Gemma OOM guard | ✅ **shipped — correctness fix** | warm new-prompt request: OOM @ 93.7 GB → 33 s success @ 78.6 GB |
+| Non-tiled VAE decode (`LTX_VAE_TILE_PX=0`) | ✅ shipped, optional | reference decode, 50–51 dB vs tiled, latency-neutral |
+| `cudnn.benchmark` | ✅ shipped | free, no regression |
+| SageAttention 2.2 (sm_120 source build) | ❌ rejected, **+5.1% slower** | ~770 compile graph breaks/request; LTX's 1:192 compression leaves only ~15 k tokens — attention is just 20–30% of step time. [`references/SAGEATTENTION_SM120.md`](references/SAGEATTENTION_SM120.md) |
+| cuDNN SDPA backend | ➖ 0% | inductor captures the SDPA backend at **trace time** — runtime `sdpa_kernel()` contexts are no-ops for compiled blocks (proved byte-identical) |
+| NVENC encode | ❌ dead under memory snapshots | works in a bare Modal function, fails (`avcodec_open2` UnknownError) in checkpoint-restored containers — in-process **and** in torch-free subprocesses |
+| SpargeAttn, step caches (@8 distilled steps), FA4/xformers, fp8/int8, max-autotune | ❌ rejected | no sm_120 kernels / collapse at 8 steps / quality rule / measured slower |
+
+Floor: a warm 5 s clip is ~19.5 s GPU-bound bf16 DiT + ~2.7 s CPU x264 encode + ~0.5 s overhead. The DiT term only moves with quantization or step cuts — both off the table by the quality rule. Full record: [`references/LATENCY_FANOUT_2026_06_10.md`](references/LATENCY_FANOUT_2026_06_10.md), distilled gotchas in [`references/learnings.md`](references/learnings.md).
+
+Two transferable gotchas worth stealing:
+1. **Inductor captures the SDPA backend at trace time** — benchmarking attention backends with runtime context managers on a compiled model measures nothing.
+2. **Same-prompt benchmarks never exercise the text-encoder memory path** — always include a warm new-prompt arm, or you'll ship a latent OOM like the one found here.
 
 ---
 
@@ -156,7 +187,10 @@ Helper modules live in `utils/` and are mounted into the container.
 pyproject.toml             # uv project (client-side dep: Modal SDK)
 deploy.sh                  # one-command deploy
 deploy/ltx2_model.py       # the Modal app: t2v / i2v / keyframe / v2v + opt stack
+deploy/bench_*.py          # same-container A/B bench drivers (sage, cudnn, matrix, fixes)
+deploy/probe_nvenc.py      # bare-container NVENC probe (no memory snapshot)
 deploy/utils/              # helper package (weight registries, FBCache, guiders)
+references/                # research findings: latency fan-out, sage sm_120, learnings
 skills/ltx2-video/         # Claude Code skill (SKILL.md + scripts/submit_video.py)
 tests/                     # smoke_test.py + ship_verify.py
 assets/demo.gif

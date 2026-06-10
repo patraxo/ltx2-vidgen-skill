@@ -15,9 +15,33 @@ Hard-won, measured findings from running LTX-2.3 (22B) self-hosted on one RTX PR
 ## Precision / attention (all rejected — kept bf16)
 
 - **fp8** (cast / scaled-mm): rejected — quality bar is bf16. (Studied LTX repos lean on fp8 to fit; we don't.)
-- **SageAttention / SageAttention-3 (FP4)**: black frames / noise on this path.
+- **SageAttention-2.2 (INT8-QK + fp16-PV/fp32-accum)**: RE-TESTED 2026-06-10 with correct
+  source build (CUDA-13 base, sm_120 kernels — old "black frames" = env failure: nvcc 12.4
+  never built it, patch was inert). Verdict: **works, no black frames, audio intact — but
+  NET SLOWER: 23.88s vs 22.72s SDPA warm (-5.1%)** at 768×1280×121f/8-step. Why: our
+  torch.compile'd flash-SDPA baseline is strong; sage = untraceable external op → graph
+  breaks per block; LTX 1:192 compression → short seqs → attention share too small. Also
+  nondeterministic run-to-run (SDPA = byte-identical) and trajectory diverges (PSNR 33.7 dB
+  vs SDPA, per-frame quality comparable). REJECTED as default; patch stays (default OFF),
+  runtime-togglable via `smoke_generate(sage_attn=1)`. First runtime flip costs ~70s recompile.
+- **SageAttention-3 (FP4)**: banned — fp4 attention, quality rule bf16-only.
 - **flash-attn**: no sm_120 kernel → PyTorch SDPA (exact) is used.
 - **max-autotune** (torch.compile): tested, slower here than default compile.
+- **SDPA backend is captured at TRACE time** (2026-06-10): inductor lowers
+  F.s_d_p_a to a specific backend kernel during compile — a runtime
+  `sdpa_kernel(set_priority=True)` context around the call does NOTHING for
+  already-compiled blocks (proved: cuDNN-flip arm mp4 byte-identical to base).
+  To change backend, the FIRST call of a fresh container must run under the
+  desired priority. cuDNN-first measured = 0% vs flash (22.735s vs 22.72s
+  medians, quiet hosts) — short LTX seqs + fused blocks equalize them.
+- **Bench noise across Modal hosts**: same arm 23.18↔28.92s (±11-20%) on a
+  noisy host vs ±0.5% on a quiet one. Never trust single-run cross-arm deltas;
+  use byte-compares (SDPA path is deterministic per container+config) + medians.
+- **VAE no-tiling (`tile_px=0`, 2026-06-10)**: non-tiled reference decode at
+  768×1280×121f costs only +2.6 GB peak (74.3→76.9), latency-neutral, PSNR
+  50.4 dB / SSIM 0.994 vs tiled (the delta IS the tiled arm's seam error),
+  audio bit-equal. Use for standard reels; default stays tiled (retake/HQ at
+  big res = decode-peak risk).
 
 ## VAE tiling
 
@@ -35,3 +59,34 @@ Hard-won, measured findings from running LTX-2.3 (22B) self-hosted on one RTX PR
 - **Canny control**: derive a DENSE edge map (`edgedetect=low=0.05:high=0.2`); sparse thresholds on a soft-lit face yield only a hair outline → the model drifts.
 - **Keyframe coherence**: A and B must be the same subject/scene or you get a morph/identity-swap, not motion. Derive B by editing A, or use a clip's first/last frames.
 - **v2v (retake)** is the slowest mode (~470 s for a 10 s window — single-stage full-CFG).
+
+## NVENC is dead under Modal memory snapshots (2026-06-10)
+
+`enable_memory_snapshot=True` ⇒ every serving container runs a
+checkpoint-restored process. NVENC session creation
+(`avcodec_open2("h264_nvenc")` → `UnknownError(1313558101)`) fails
+container-wide in restored containers — parent process AND torch-free child
+subprocesses — while the identical open passes in a plain non-snapshot
+function on the same image + GPU class. Modal's GPU restore covers CUDA
+compute, not the NVENC device-fd/ioctl surface. Don't burn time on encoder
+swaps inside snapshot apps; test NVENC in a bare function first AND in the
+real lifecycle before building anything.
+
+## Warm-container OOM on first NEW prompt — Gemma full-GPU build (2026-06-10)
+
+Upstream `PromptEncoder.__call__` builds the full ~23 GB Gemma per call. With
+both stage transformers persisted (~70.8 GB), the first emb-cache MISS on a
+warm container = 93.75 GB → OOM = dead request. Hidden by every same-prompt
+bench (always HIT). Fix shipped: emb-cache wrapper flips the MISS call to
+upstream `OffloadMode.CPU` streaming (layer-wise, ~5 GB peak, identical
+embeddings) when free VRAM < `LTX_EMB_STREAM_FREE_GB` (28). Cost +10.2 s once
+per prompt per container. LESSON: benches that reuse one prompt never
+exercise the text-encoder memory path — always include a new-prompt warm arm.
+
+## Batch overlap worth it; side-stream theory was wrong (2026-06-10)
+
+3-clip batch: overlap (worker-thread finalize on the DEFAULT stream) wall
+73.65 s vs 92.49 s serial = −20.4 %, peak 76 GB. The earlier clip-2 OOM was
+NOT side-stream pool stranding — it was the Gemma MISS above. Cross-stream
+allocator pools still don't share (keep finalize on the default stream), but
+the OOM blame belonged to the text encoder.
