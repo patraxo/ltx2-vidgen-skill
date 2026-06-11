@@ -160,6 +160,12 @@ Helper modules live in `utils/` and are mounted into the container.
 
 ## Performance research (June 2026)
 
+Three write-ups of the findings, written to be useful beyond this repo:
+
+- **[Why SageAttention made our 22B video model slower](docs/why-sageattention-made-our-22b-video-model-slower.md)** — compile graph breaks vs kernel wins, and the trace-time SDPA gotcha
+- **[NVENC fails in Modal memory-snapshot containers](docs/nvenc-fails-in-modal-memory-snapshot-containers.md)** — the four-experiment evidence chain
+- **[The text-encoder OOM your benchmarks never catch](docs/the-text-encoder-oom-your-benchmarks-never-catch.md)** — why same-prompt load tests hide a multi-GB allocation
+
 A systematic study of lossless latency levers for this stack — every lever measured A/B on the same warm container, gated on zero visual loss (blackdetect + PSNR/SSIM + frame inspection + audio). Full write-ups in [`references/`](references/):
 
 | Lever | Verdict | Evidence |
