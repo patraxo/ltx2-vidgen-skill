@@ -111,9 +111,22 @@ Cold start (first clip on a fresh container) ~90–200 s; idle scales to **$0**.
 - First-block feature cache (~17%), CPU-pinned weight cache, text-embedding cache, torch.compile (persisted Inductor cache), tunable VAE-decode tiling.
 - **fp8 / SageAttention / flash-attn all tested and rejected** — fp8: quality rule; flash-attn: no sm_120 kernel; SageAttention 2.2: builds + runs on sm_120 but measured +5% slower here (compile graph breaks — see Performance research below). Speed comes from architecture, not from cheapening the math.
 
-### Costs — and what that buys you
+### The pricing problem, solved
 
-New Modal accounts get **$30/month in free credits**. At ~2.6¢ per 4-second clip that's **~1,000 free clips/month** — so you can explore a prompt 20 ways (`--variations 20`) and keep the one that lands, for pennies. It's **your** Modal account and bill (visible in your dashboard), no per-clip meter, no rate limit, idle = $0.
+Per-clip APIs charge you for every take — including the failed ones. Iteration is exactly how you get good AI video, so the meter punishes the workflow that works. Self-hosting flips the economics:
+
+| 30 s of video with audio (~720p+) | Approx. cost | vs this stack |
+|---|---|---|
+| **This stack** (your Modal GPU, per-second billing) | **~$0.11** | — |
+| Hosted open-weight APIs (often quantized variants) | ~$0.35–0.70 | 3–6× |
+| Runway Gen-4 Turbo | ~$0.75 | ~7× |
+| Kling Pro | ~$2–3.50 | 15–30× |
+| Sora 2 API | ~$3–15 | 25–120× |
+| Veo 3.x (with audio) | ~$4.50–13 | 40–110× |
+
+*Third-party prices are approximate (mid-2026) and change often — verify before quoting. The point isn't the decimals; it's the shape: a failed take here costs cents, twenty variations cost a coffee, and the quality knob is yours (full bf16, no silent quantization).*
+
+New Modal accounts get **$30/month in free credits**. At ~1.9¢ per 5-second clip that's **~1,500 free clips/month** — explore a prompt 20 ways (`--variations 20`) and keep the one that lands. It's **your** Modal account and bill (visible in your dashboard), no per-clip meter, no rate limit, idle = $0.
 
 ---
 
